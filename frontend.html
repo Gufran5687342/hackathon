@@ -1,0 +1,486 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CICADA Cloud | Tier 2 Central SaaS</title>
+  <style>
+    :root {
+      --bg: #081321;
+      --panel: #101f31;
+      --line: #263b51;
+      --text: #e8f0f8;
+      --muted: #91a5ba;
+      --teal: #28c6bd;
+      --green: #39c98a;
+      --yellow: #f2bd55;
+      --red: #ff6b78;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, Arial; }
+    header {
+      padding: 15px 24px;
+      background: #0b1929;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    header b { font-size: 18px; letter-spacing: 1px; }
+    .layout { display: grid; grid-template-columns: 210px 1fr; min-height: calc(100vh - 60px); }
+    aside { background: #0b1929; padding: 18px; border-right: 1px solid var(--line); }
+    nav button {
+      display: block;
+      width: 100%;
+      text-align: left;
+      margin: 5px 0;
+      background: transparent;
+      color: var(--muted);
+      border: 0;
+      padding: 11px;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    nav button.active, nav button:hover { background: #173349; color: white; font-weight: 600; }
+    main { padding: 26px; max-width: 1400px; width: 100%; margin: auto; }
+    .view { display: none; }
+    .view.active { display: block; }
+    .top { display: flex; justify-content: space-between; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 20px; }
+    h1 { font-size: 26px; margin: 3px 0; }
+    .muted { color: var(--muted); font-size: 12.5px; }
+    .grid { display: grid; gap: 14px; }
+    .stats { grid-template-columns: repeat(4, 1fr); }
+    .two { grid-template-columns: 1.3fr 1fr; }
+    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 13px; padding: 17px; min-width: 0; }
+    .value { font-size: 28px; font-weight: 750; margin: 5px 0; }
+    .tag { display: inline-block; padding: 3px 9px; border-radius: 20px; background: #193b35; color: #72e2b1; font-size: 11px; font-weight: 600; }
+    .tag.fair { background: #3b2f19; color: var(--yellow); }
+    .tag.poor { background: #3b1921; color: var(--red); }
+    .tag.region { background: #172a45; color: #7dd3fc; font-family: monospace; }
+    .warn { color: var(--yellow); }
+    .bad { color: var(--red); }
+    .good { color: var(--green); }
+    button, select, input {
+      background: #1b3047;
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 13px;
+    }
+    button { cursor: pointer; }
+    button.primary { background: var(--teal); color: #062226; border: 0; font-weight: 700; }
+    .bar { height: 8px; background: #23374c; border-radius: 9px; overflow: hidden; margin: 6px 0 14px; }
+    .bar span { display: block; height: 100%; background: var(--teal); transition: width 0.3s; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    td, th { text-align: left; padding: 10px; border-bottom: 1px solid var(--line); }
+    th { color: var(--muted); }
+    .incident { padding: 12px; border-left: 3px solid var(--red); background: #14283a; margin: 10px 0; border-radius: 6px; }
+    .notice { padding: 13px; background: #132f3b; border: 1px solid #24545a; border-radius: 10px; margin-bottom: 15px; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .redact-pill { background: #3b1921; color: #ff8e98; padding: 1px 5px; border-radius: 4px; font-family: monospace; }
+    .match-row { background: rgba(40, 198, 189, 0.16); }
+    .footer { font-size: 11px; color: #738ba2; margin-top: 20px; }
+    @media(max-width: 800px) {
+      .layout { grid-template-columns: 1fr; }
+      aside { position: sticky; top: 0; z-index: 3; overflow: auto; padding: 7px; }
+      nav { display: flex; min-width: max-content; }
+      nav button { width: auto; }
+      main { padding: 15px; }
+      .stats { grid-template-columns: repeat(2, 1fr); }
+      .two { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div>
+      <b>◈ CICADA CLOUD <small style="display:block;font-size:10px;color:#91a5ba">TIER 2 CENTRAL SAAS · METADATA-ONLY OPERATIONS</small></b>
+    </div>
+    <div class="actions">
+      <span class="tag" id="conn">● Connecting (:8000)...</span>
+      <select id="tenant" onchange="refreshSaaS()">
+        <option value="customer-001">Tenant: customer-001</option>
+        <option value="customer-002">Tenant: customer-002</option>
+      </select>
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside>
+      <nav>
+        <button class="active" data-v="overview">▦ Overview</button>
+        <button data-v="infra">▤ Infrastructure</button>
+        <button data-v="incidents">⚑ Incidents & Ingest</button>
+      </nav>
+    </aside>
+
+    <main>
+
+      <!-- PAGE 1: FLEET OVERVIEW -->
+      <section class="view active" id="overview">
+        <div class="top">
+          <div>
+            <div class="tag">TIER 2 · FLEET OVERVIEW</div>
+            <h1>Observability command center</h1>
+            <div class="muted">Tenant-isolated metadata monitoring. Zero raw logs or secrets enter this platform.</div>
+          </div>
+          <div class="actions">
+            <button class="primary" onclick="refreshSaaS()">↻ Refresh telemetry</button>
+          </div>
+        </div>
+
+        <div class="grid stats">
+          <div class="card">
+            Monitored sources
+            <div class="value" id="totalSources">0</div>
+            <span class="muted">Active in selected tenant</span>
+          </div>
+          <div class="card">
+            Healthy systems
+            <div class="value good" id="healthy">0</div>
+            <span class="muted">Excellent + Good</span>
+          </div>
+          <div class="card">
+            Open incidents
+            <div class="value warn" id="icount">0</div>
+            <span class="muted">Correlated alerts</span>
+          </div>
+          <div class="card">
+            Collector status
+            <div class="value" id="cstatus">Online</div>
+            <span class="muted" id="heartbeat">Last heartbeat: just now</span>
+          </div>
+        </div>
+
+        <div class="grid two" style="margin-top:14px">
+          <div class="card">
+            <h3>Infrastructure & network signals</h3>
+            <div id="metrics"></div>
+          </div>
+          <div class="card">
+            <h3>Health states & classification reasons</h3>
+            <div id="health"></div>
+            <p class="muted" style="margin-top:10px">Any collector silent &gt; 60s automatically downgrades to <b>Poor (Offline)</b>.</p>
+          </div>
+        </div>
+
+        <div class="grid two" style="margin-top:14px">
+          <div class="card">
+            <h3>Latest correlated incident</h3>
+            <div id="latest">No active incident. Systems look stable.</div>
+          </div>
+          <div class="card">
+            <h3>Collector fleet health (Backend /collectors)</h3>
+            <div style="overflow:auto">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Collector / Source</th>
+                    <th>Last Seen</th>
+                    <th>Version</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody id="fleetRows"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- PAGE 2: INFRASTRUCTURE MONITORING -->
+      <section class="view" id="infra">
+        <div class="top">
+          <div>
+            <div class="tag">TIER 2 · TELEMETRY MATRIX</div>
+            <h1>Infrastructure monitoring</h1>
+            <p class="muted">Approved metric metadata for pseudonymized sources in the selected tenant.</p>
+          </div>
+          <button class="primary" onclick="refreshSaaS()">↻ Refresh metrics</button>
+        </div>
+
+        <div class="card">
+          <h3>Monitored sources</h3>
+          <div style="overflow:auto">
+            <table>
+              <thead>
+                <tr>
+                  <th>Source ID</th>
+                  <th>Region / TZ</th>
+                  <th>CPU</th>
+                  <th>Memory</th>
+                  <th>Disk</th>
+                  <th>Latency</th>
+                  <th>Packet loss</th>
+                  <th>Health</th>
+                </tr>
+              </thead>
+              <tbody id="rows"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- PAGE 3: INCIDENTS, RECOMMENDATIONS & INGEST LOG -->
+      <section class="view" id="incidents">
+        <div class="top">
+          <div>
+            <div class="tag">TIER 2 · AIOPS & INGEST LOG</div>
+            <h1>Incidents, recommendations & ingest log</h1>
+            <p class="muted">Correlated multi-signal alerts from /aiops/correlate and received allow-listed payloads.</p>
+          </div>
+          <button class="primary" onclick="refreshSaaS()">↻ Sync latest</button>
+        </div>
+
+        <div class="grid two">
+          <div class="card">
+            <h3>Correlated incidents</h3>
+            <div id="list">No open incidents.</div>
+          </div>
+          <div class="card">
+            <h3>Explainable recommendation</h3>
+            <div id="recommend" class="notice">No active anomaly. Systems within baseline thresholds.</div>
+            <div id="approveWrap" style="display:none; margin-top:10px;">
+              <button class="primary" onclick="approveAction()">✓ Resolve Incident (PATCH /incidents)</button>
+            </div>
+            <div id="remediationReceipt" style="margin-top:10px; font-size:12px;"></div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:14px">
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:10px;">
+            <h3 style="margin:0;">SaaS Ingest Log (Sanitized Metadata Only)</h3>
+            <input type="text" id="pidFilter" oninput="refreshSaaS()" placeholder="Paste Payload ID from Tier 1 to verify..." style="width:280px;">
+          </div>
+          <div style="overflow:auto">
+            <table>
+              <thead>
+                <tr>
+                  <th>Payload ID</th>
+                  <th>Region</th>
+                  <th>UTC Timestamp</th>
+                  <th>Source ID</th>
+                  <th>Metric</th>
+                  <th>Health</th>
+                  <th>Scrubbed Alert Context</th>
+                </tr>
+              </thead>
+              <tbody id="ingestRows"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <div class="footer">CICADA Cloud · Tier 2 Metadata-Only SaaS · Connected to FastAPI (:8000)</div>
+    </main>
+  </div>
+
+  <script>
+    const BACKEND_BASE = "http://127.0.0.1:8000/api/v1";
+    const $ = id => document.getElementById(id);
+    let activeIncidentId = null;
+
+    function redactHtml(text) {
+      return (text || "-").replace(/(\[REDACTED_[A-Z_]+\])/g, '<span class="redact-pill">$1</span>');
+    }
+
+    function healthTag(state) {
+      const cls = state === "Poor" || state === "Offline" ? "poor" : state === "Fair" ? "fair" : "";
+      return `<span class="tag ${cls}">${state}</span>`;
+    }
+
+    async function refreshSaaS() {
+      const tenantId = $("tenant").value;
+      const pidQuery = $("pidFilter").value.trim().toLowerCase();
+      const t0 = performance.now();
+
+      try {
+        // 1. Fetch telemetry events
+        const telRes = await fetch(`${BACKEND_BASE}/telemetry?tenant_id=${encodeURIComponent(tenantId)}`);
+        if (!telRes.ok) throw new Error("Backend offline");
+        const telData = await telRes.json();
+        const ms = Math.max(8, Math.round(performance.now() - t0));
+
+        // 2. Fetch collector fleet status (60s watchdog handled by backend.py)
+        const colRes = await fetch(`${BACKEND_BASE}/collectors?tenant_id=${encodeURIComponent(tenantId)}`);
+        const colData = colRes.ok ? await colRes.json() : { collectors: [] };
+
+        // 3. Run & fetch correlated incidents
+        const incRes = await fetch(`${BACKEND_BASE}/aiops/correlate?tenant_id=${encodeURIComponent(tenantId)}`);
+        const incData = incRes.ok ? await incRes.json() : { incidents: [] };
+
+        $("conn").textContent = `● Live FastAPI Connected (${ms}ms)`;
+        $("conn").className = "tag";
+
+        renderDashboard(
+          tenantId,
+          telData.events || [],
+          colData.collectors || [],
+          incData.incidents || [],
+          pidQuery
+        );
+      } catch (err) {
+        $("conn").textContent = "● Backend (:8000) Unreachable — Start uvicorn";
+        $("conn").className = "tag poor";
+      }
+    }
+
+    function renderDashboard(tenantId, events, collectors, incidents, pidQuery) {
+      const sorted = [...events].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+      const now = Date.now();
+
+      // Latest status per source_id
+      const latestByNode = {};
+      sorted.forEach(ev => { latestByNode[ev.source_id] = ev; });
+
+      const nodes = Object.values(latestByNode).map(ev => {
+        const ageSec = Math.max(0, Math.floor((now - new Date(ev.timestamp).getTime()) / 1000));
+        const offline = ageSec > 60;
+        return { ...ev, ageSec, offline, effectiveState: offline ? "Poor" : ev.health_state };
+      });
+
+      const counts = { Excellent: 0, Good: 0, Fair: 0, Poor: 0 };
+      nodes.forEach(n => { counts[n.effectiveState] = (counts[n.effectiveState] || 0) + 1; });
+
+      const anyOffline = collectors.some(c => c.status === "Offline") || nodes.some(n => n.offline);
+      const openIncidents = incidents.filter(i => i.status !== "Resolved");
+
+      $("totalSources").textContent = nodes.length;
+      $("healthy").textContent = counts.Excellent + counts.Good;
+      $("icount").textContent = openIncidents.length;
+      $("cstatus").textContent = anyOffline ? "Degraded" : "Online";
+      $("cstatus").className = "value " + (anyOffline ? "bad" : "good");
+
+      const latestEv = sorted[sorted.length - 1];
+      const latestAge = latestEv ? Math.max(0, Math.floor((now - new Date(latestEv.timestamp).getTime()) / 1000)) : 0;
+      $("heartbeat").textContent = latestEv ? `Last event: ${latestAge}s ago` : "Waiting for collector...";
+
+      // Signal bars
+      const baseCpu = latestEv && latestEv.metric_name.toLowerCase().includes("cpu") ? latestEv.metric_value : 35;
+      const baseLat = latestEv && latestEv.metric_name.toLowerCase().includes("latency") ? latestEv.metric_value : 24;
+      const bars = [
+        ["CPU Usage", baseCpu, "%"],
+        ["Memory Usage", Math.min(100, Math.round(baseCpu * 0.85)), "%"],
+        ["Disk Usage", 61, "%"],
+        ["Network Latency", baseLat, " ms"],
+        ["Packet Loss", baseCpu > 85 || baseLat > 200 ? 3.2 : 0.2, "%"]
+      ];
+      $("metrics").innerHTML = bars.map(([k, v, u]) => {
+        const pct = u === " ms" ? Math.min(100, v / 3) : k === "Packet Loss" ? Math.min(100, v * 15) : Math.min(100, v);
+        const col = pct > 85 ? "var(--red)" : pct > 65 ? "var(--yellow)" : "var(--teal)";
+        return `<p style="margin:6px 0">${k}<b style="float:right">${v}${u}</b></p>
+                <div class="bar"><span style="width:${pct}%;background:${col}"></span></div>`;
+      }).join("");
+
+      // 4 Health states
+      const reasons = [
+        ["Excellent", "Within baseline (<50%) & active heartbeat"],
+        ["Good", "Normal operating variance (50–64%)"],
+        ["Fair", "Elevated load (65–84%); early warning"],
+        ["Poor", "Critical breach (>85%) or silent >60s"]
+      ];
+      $("health").innerHTML = reasons.map(([st, desc]) =>
+        `<p style="margin:9px 0">${healthTag(st)} <span class="muted" style="margin-left:6px">${desc}</span><b style="float:right">${counts[st]}</b></p>`
+      ).join("");
+
+      // Collector fleet table (from /api/v1/collectors)
+      $("fleetRows").innerHTML = collectors.map(c => `
+        <tr>
+          <td style="font-family:monospace;color:var(--teal)">${c.collector_id} (${c.source_id})</td>
+          <td>${c.seconds_since_last_seen}s ago</td>
+          <td>${c.version}</td>
+          <td>${healthTag(c.status)}</td>
+        </tr>
+      `).join("") || `<tr><td colspan="4" class="muted">No registered collectors for ${tenantId}.</td></tr>`;
+
+      // Page 2: Infrastructure table
+      $("rows").innerHTML = nodes.map(n => `
+        <tr>
+          <td style="font-family:monospace;color:var(--teal)">${n.source_id}</td>
+          <td><span class="tag region">${n.region || "ap-south-1"}</span> <span class="muted">${n.source_timezone || "UTC"}</span></td>
+          <td>${n.metric_name.toLowerCase().includes("cpu") ? n.metric_value + "%" : "34%"}</td>
+          <td>${n.effectiveState === "Poor" ? "88%" : "48%"}</td>
+          <td>61%</td>
+          <td>${n.metric_name.toLowerCase().includes("latency") ? n.metric_value + " ms" : "24 ms"}</td>
+          <td>${n.effectiveState === "Poor" ? "3.2%" : "0.2%"}</td>
+          <td>${healthTag(n.effectiveState)}</td>
+        </tr>
+      `).join("") || `<tr><td colspan="8" class="muted">No telemetry ingested for ${tenantId} yet.</td></tr>`;
+
+      // Page 3: Correlated incidents from backend /aiops/correlate
+      if (openIncidents.length > 0) {
+        const top = openIncidents[0];
+        activeIncidentId = top.incident_id;
+        $("latest").innerHTML = `<div class="incident"><b>${top.incident_type} on ${top.source_id}</b><p style="margin:4px 0;font-size:12px">${top.alert_count} correlated alerts · Severity: ${top.severity.toUpperCase()}</p></div>`;
+        $("list").innerHTML = openIncidents.map(inc => `
+          <div class="incident">
+            <b>${inc.incident_type} on <code>${inc.source_id}</code></b>
+            <p style="margin:6px 0;font-size:12px">Merged <b>${inc.alert_count}</b> correlated alerts (${inc.window_start.split("T")[1].slice(0, 8)}Z – ${inc.window_end.split("T")[1].slice(0, 8)}Z)</p>
+            <small class="muted">Status: ${inc.status} · ID: ${inc.incident_id.slice(0, 8)}</small>
+          </div>
+        `).join("");
+        $("recommend").innerHTML = `
+          <b>Why flagged:</b> ${top.alert_count} anomaly alerts correlated on <code>${top.source_id}</code> within ${top.correlation_window_minutes} minutes.<br><br>
+          <b>Actionable recommendation:</b> ${top.recommendation}`;
+        $("approveWrap").style.display = "block";
+      } else {
+        activeIncidentId = null;
+        $("latest").textContent = "No active incident. Systems look stable.";
+        $("list").textContent = "No open correlated incidents (note: backend correlates 2+ anomalies within 5 mins).";
+        $("recommend").textContent = "No active correlated anomaly. Inject 2+ anomalies on collector.html to trigger correlation.";
+        $("approveWrap").style.display = "none";
+      }
+
+      // Page 3: Ingest Log Table
+      const filteredIngest = [...sorted].reverse().filter(ev =>
+        !pidQuery || (ev.payload_id || "").toLowerCase().includes(pidQuery)
+      );
+      $("ingestRows").innerHTML = filteredIngest.map(ev => {
+        const matched = pidQuery && ev.payload_id.toLowerCase().includes(pidQuery);
+        return `
+          <tr class="${matched ? 'match-row' : ''}">
+            <td style="font-family:monospace;color:var(--teal)">${ev.payload_id}</td>
+            <td><span class="tag region">${ev.region || "ap-south-1"}</span></td>
+            <td style="font-family:monospace">${ev.timestamp.split("T")[1].slice(0, 8)}Z</td>
+            <td style="font-family:monospace">${ev.source_id}</td>
+            <td>${ev.metric_name}: <b>${ev.metric_value}</b> ${ev.metric_unit}</td>
+            <td>${healthTag(ev.health_state)}</td>
+            <td>${redactHtml(ev.alert_context)}</td>
+          </tr>
+        `;
+      }).join("") || `<tr><td colspan="7" class="muted">No matching payloads in database.</td></tr>`;
+    }
+
+    async function approveAction() {
+      if (!activeIncidentId) return;
+      const tenantId = $("tenant").value;
+      const res = await fetch(
+        `${BACKEND_BASE}/incidents/${encodeURIComponent(activeIncidentId)}?tenant_id=${encodeURIComponent(tenantId)}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ status: "Resolved" })
+        }
+      );
+      if (res.ok) {
+        $("remediationReceipt").innerHTML = `<span class="tag">✓ Incident marked Resolved via PATCH /api/v1/incidents</span>`;
+        await refreshSaaS();
+      }
+    }
+
+    document.querySelectorAll("nav button").forEach(b => {
+      b.onclick = () => {
+        document.querySelectorAll("nav button").forEach(x => x.classList.toggle("active", x === b));
+        document.querySelectorAll(".view").forEach(x => x.classList.toggle("active", x.id === b.dataset.v));
+      };
+    });
+
+    refreshSaaS();
+    setInterval(refreshSaaS, 3000);
+  </script>
+</body>
+</html>

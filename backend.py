@@ -1,533 +1,632 @@
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone, timedelta
-from typing import Literal
-import statistics
+
+import json
 import sqlite3
+import time
 import uuid
+import socket
+import platform
+from pathlib import Path
+from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict, field_validator
-
-
-DATABASE_NAME = "telemetry.db"
-
-# Collector liveness rules (collector sends a heartbeat every ~20 seconds)
-ONLINE_WITHIN_SECONDS = 40
-OFFLINE_AFTER_SECONDS = 60
+import requests
+import psutil
 
 
-def utc_now():
-    return datetime.now(timezone.utc).isoformat()
+# ============================================================
+# CONFIGURATION — MUST MATCH BACKEND
+# ============================================================
+
+BACKEND_URL = "http://127.0.0.1:8000"
+
+TENANT_ID = "customer-001"
+COLLECTOR_ID = "collector-001"
+SOURCE_ID = socket.gethostname()
+
+REGION = "ap-south-1"
+COLLECTOR_VERSION = "1.0.0"
+
+# Exact token from backend.py
+COLLECTOR_API_TOKEN = "cicada-2026-secure-collector-key"
+
+TELEMETRY_URL = f"{BACKEND_URL}/api/v1/telemetry/ingest"
+REGISTER_URL = f"{BACKEND_URL}/api/v1/collectors/register"
+HEARTBEAT_URL = f"{BACKEND_URL}/api/v1/collectors/heartbeat"
+
+COLLECTION_INTERVAL = 5
+REQUEST_TIMEOUT = 10
+MAX_BATCH_SIZE = 50
+HEARTBEAT_INTERVAL = 20
+
+BASE_DIR = Path(__file__).resolve().parent
+BUFFER_DB = BASE_DIR / "collector_buffer.db"
+
+session = requests.Session()
+
+session.headers.update({
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "X-Collector-Token": COLLECTOR_API_TOKEN
+})
 
 
-def get_db_connection():
-    connection = sqlite3.connect(DATABASE_NAME)
-    connection.row_factory = sqlite3.Row
-    return connection
+# ============================================================
+# DATABASE / BUFFER
+# ============================================================
+
+def initialize_buffer():
+
+    with sqlite3.connect(BUFFER_DB) as conn:
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS telemetry_buffer (
+                payload_id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                attempts INTEGER DEFAULT 0,
+                next_attempt REAL DEFAULT 0,
+                last_error TEXT DEFAULT '',
+                created_at REAL NOT NULL
+            )
+        """)
+
+        conn.commit()
+
+    print("[BUFFER] Persistent buffer initialized.")
 
 
-def initialize_database():
-    connection = get_db_connection()
+def enqueue_event(payload):
 
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS telemetry (
-            payload_id TEXT PRIMARY KEY,
-            tenant_id TEXT NOT NULL,
-            region TEXT NOT NULL DEFAULT 'ap-south-1',
-            source_id TEXT NOT NULL,
-            timestamp TEXT NOT NULL,
-            source_timezone TEXT NOT NULL DEFAULT 'UTC',
-            metric_name TEXT NOT NULL,
-            metric_value REAL NOT NULL,
-            metric_unit TEXT NOT NULL,
-            health_state TEXT NOT NULL,
-            event_category TEXT NOT NULL,
-            severity TEXT NOT NULL,
-            alert_context TEXT
-        )
-    """)
+    with sqlite3.connect(BUFFER_DB) as conn:
 
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS collectors (
-            tenant_id TEXT NOT NULL,
-            region TEXT NOT NULL DEFAULT 'ap-south-1',
-            collector_id TEXT NOT NULL,
-            source_id TEXT,
-            version TEXT,
-            registered_at TEXT NOT NULL,
-            last_seen TEXT NOT NULL,
-            cpu_percent REAL,
-            memory_percent REAL,
-            buffered_events INTEGER,
-            PRIMARY KEY (tenant_id, collector_id)
-        )
-    """)
+        conn.execute("""
+            INSERT OR IGNORE INTO telemetry_buffer
+            (payload_id, payload, attempts, next_attempt,
+             last_error, created_at)
+            VALUES (?, ?, 0, 0, '', ?)
+        """, (
+            payload["payload_id"],
+            json.dumps(payload),
+            time.time()
+        ))
 
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS remediation_audit (
-            audit_id TEXT PRIMARY KEY,
-            tenant_id TEXT NOT NULL,
-            incident_id TEXT NOT NULL,
-            action_taken TEXT NOT NULL,
-            approved_by TEXT NOT NULL,
-            policy_check TEXT NOT NULL,
-            rollback_plan TEXT NOT NULL,
-            status TEXT NOT NULL,
-            executed_at TEXT NOT NULL
-        )
-    """)
-
-    connection.commit()
-    connection.close()
+        conn.commit()
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    initialize_database()
-    yield
+def get_buffer_count():
+
+    with sqlite3.connect(BUFFER_DB) as conn:
+
+        result = conn.execute(
+            "SELECT COUNT(*) FROM telemetry_buffer"
+        ).fetchone()
+
+    return result[0]
 
 
-app = FastAPI(
-    title="Smart Observability Platform",
-    description="Secure AI-powered observability backend (CICADA 2026)",
-    version="2.0.0",
-    lifespan=lifespan
-)
+def get_pending_events():
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    with sqlite3.connect(BUFFER_DB) as conn:
 
+        rows = conn.execute("""
+            SELECT payload_id, payload, attempts
+            FROM telemetry_buffer
+            WHERE next_attempt <= ?
+            ORDER BY created_at ASC
+            LIMIT ?
+        """, (
+            time.time(),
+            MAX_BATCH_SIZE
+        )).fetchall()
 
-# --- PYDANTIC SCHEMAS (STRICT ALLOW-LISTING) ---
-class TelemetryEvent(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    payload_id: str
-    tenant_id: str
-    region: str = "ap-south-1"
-    source_id: str
-    timestamp: datetime
-    source_timezone: str = "UTC"
-    metric_name: str
-    metric_value: float
-    metric_unit: str
-
-    health_state: Literal["Excellent", "Good", "Fair", "Poor"]
-    event_category: Literal["infrastructure", "network", "security", "collector"]
-    severity: Literal["info", "warning", "critical"]
-    alert_context: str | None = None
-
-    @field_validator("timestamp")
-    @classmethod
-    def timestamp_to_utc(cls, value: datetime):
-        if value.tzinfo is None:
-            raise ValueError("timestamp must include a timezone, e.g. 2026-11-21T02:00:00Z")
-        return value.astimezone(timezone.utc)
+    return rows
 
 
-class CollectorRegistration(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+def remove_event(payload_id):
 
-    collector_id: str
-    tenant_id: str
-    region: str = "ap-south-1"
-    source_id: str
-    version: str
+    with sqlite3.connect(BUFFER_DB) as conn:
 
+        conn.execute("""
+            DELETE FROM telemetry_buffer
+            WHERE payload_id = ?
+        """, (payload_id,))
 
-class CollectorHeartbeat(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    collector_id: str
-    tenant_id: str
-    region: str = "ap-south-1"
-    version: str
-    cpu_percent: float | None = None
-    memory_percent: float | None = None
-    buffered_events: int | None = None
+        conn.commit()
 
 
-class RemediationApproval(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+def update_failed_event(payload_id, attempts, error):
 
-    tenant_id: str
-    incident_id: str
-    approved_by: str
-    action_taken: str
+    delay = min(
+        2 ** min(attempts, 6),
+        60
+    )
+
+    with sqlite3.connect(BUFFER_DB) as conn:
+
+        conn.execute("""
+            UPDATE telemetry_buffer
+            SET attempts = ?,
+                next_attempt = ?,
+                last_error = ?
+            WHERE payload_id = ?
+        """, (
+            attempts,
+            time.time() + delay,
+            str(error)[:1000],
+            payload_id
+        ))
+
+        conn.commit()
 
 
-# --- AIOPS: BASELINE Z-SCORE + DOMAIN INTELLIGENCE ---
-def detect_anomaly_with_baseline(metric_name: str, metric_value: float, history_values: list[float]):
-    metric = metric_name.lower()
-    z_score = 0.0
-    baseline_mean = metric_value
+# ============================================================
+# HEALTH AND SEVERITY
+# Must match backend Pydantic Literal values.
+# ============================================================
 
-    if len(history_values) >= 5:
-        baseline_mean = statistics.mean(history_values)
-        stdev = statistics.pstdev(history_values)
-        if stdev > 0:
-            z_score = (metric_value - baseline_mean) / stdev
+def get_health_state(value):
 
-    # 1. Statistical deviation check (beyond static thresholds)
-    is_stat_anomaly = abs(z_score) >= 2.5
+    if value >= 90:
+        return "Poor"
 
-    # 2. Domain-specific checks across Infra, Network, and Security
-    if "cpu" in metric or "memory" in metric or "disk" in metric:
-        if metric_value > 85 or z_score >= 3.0:
-            return {
-                "anomaly_detected": True,
-                "severity": "critical",
-                "z_score": round(z_score, 2),
-                "baseline_mean": round(baseline_mean, 2),
-                "reasoning": f"{metric_name} spiked to {metric_value} (baseline: {round(baseline_mean, 1)}, Z-score: {round(z_score, 2)}).",
-                "recommendation": f"Isolate high-consumption processes on host and trigger auto-scale or service restart."
-            }
-        elif metric_value >= 70 or is_stat_anomaly:
-            return {
-                "anomaly_detected": True,
-                "severity": "warning",
-                "z_score": round(z_score, 2),
-                "baseline_mean": round(baseline_mean, 2),
-                "reasoning": f"{metric_name} elevated at {metric_value} vs rolling baseline {round(baseline_mean, 1)}.",
-                "recommendation": f"Monitor {metric_name} trend over next 5 minutes; inspect recent deployments."
-            }
+    if value >= 75:
+        return "Fair"
 
-    elif "latency" in metric or "packet_loss" in metric:
-        if metric_value > 200 or ("packet_loss" in metric and metric_value > 5) or z_score >= 3.0:
-            return {
-                "anomaly_detected": True,
-                "severity": "critical",
-                "z_score": round(z_score, 2),
-                "baseline_mean": round(baseline_mean, 2),
-                "reasoning": f"Network degradation: {metric_name} hit {metric_value} (Z-score: {round(z_score, 2)}).",
-                "recommendation": "Check upstream gateway congestion, reroute traffic to secondary region, or inspect NIC errors."
-            }
-        elif metric_value > 100 or is_stat_anomaly:
-            return {
-                "anomaly_detected": True,
-                "severity": "warning",
-                "z_score": round(z_score, 2),
-                "baseline_mean": round(baseline_mean, 2),
-                "reasoning": f"Elevated {metric_name} ({metric_value}) deviating from normal baseline ({round(baseline_mean, 1)}).",
-                "recommendation": "Verify network path stability and check for bandwidth saturation."
-            }
+    if value >= 50:
+        return "Good"
 
-    elif "failed_login" in metric or "auth" in metric:
-        if metric_value >= 5 or is_stat_anomaly:
-            return {
-                "anomaly_detected": True,
-                "severity": "critical",
-                "z_score": round(z_score, 2),
-                "baseline_mean": round(baseline_mean, 2),
-                "reasoning": f"Security alert: {int(metric_value)} repeated failed authentication attempts detected locally.",
-                "recommendation": "Temporarily block offending source IP at local firewall and enforce MFA challenge."
-            }
+    return "Excellent"
 
-    if is_stat_anomaly:
-        return {
-            "anomaly_detected": True,
-            "severity": "warning",
-            "z_score": round(z_score, 2),
-            "baseline_mean": round(baseline_mean, 2),
-            "reasoning": f"Statistical anomaly on {metric_name}: value {metric_value} is {round(z_score, 2)} std devs from baseline.",
-            "recommendation": "Inspect local host telemetry for correlated resource or network spikes."
-        }
+
+def get_severity(value):
+
+    if value >= 90:
+        return "critical"
+
+    if value >= 75:
+        return "warning"
+
+    return "info"
+
+
+# ============================================================
+# TELEMETRY PAYLOAD
+# Must match TelemetryEvent in backend.py.
+# ============================================================
+
+def create_telemetry(metric_name, metric_value, metric_unit):
+
+    metric_value = round(float(metric_value), 2)
 
     return {
-        "anomaly_detected": False,
-        "severity": "info",
-        "z_score": round(z_score, 2),
-        "baseline_mean": round(baseline_mean, 2),
-        "reasoning": "Operating within normal baseline parameters.",
-        "recommendation": "No action required."
+        "payload_id": str(uuid.uuid4()),
+
+        "tenant_id": TENANT_ID,
+
+        "region": REGION,
+
+        "source_id": SOURCE_ID,
+
+        "timestamp": datetime.now(
+            timezone.utc
+        ).isoformat(),
+
+        "source_timezone": "UTC",
+
+        "metric_name": metric_name,
+
+        "metric_value": metric_value,
+
+        "metric_unit": metric_unit,
+
+        "health_state": get_health_state(metric_value),
+
+        "event_category": "infrastructure",
+
+        "severity": get_severity(metric_value),
+
+        "alert_context": (
+            f"Collector: {COLLECTOR_ID}; "
+            f"Host: {SOURCE_ID}; "
+            f"OS: {platform.system()}; "
+            f"Metric: {metric_name}"
+        )
     }
 
 
-def collector_status(last_seen_iso: str):
-    last_seen = datetime.fromisoformat(last_seen_iso)
-    age = max(0.0, (datetime.now(timezone.utc) - last_seen).total_seconds())
+# ============================================================
+# SYSTEM METRICS
+# ============================================================
 
-    if age > OFFLINE_AFTER_SECONDS:
-        return "Offline", "Poor", age, f"No heartbeat for {int(age)}s (limit {OFFLINE_AFTER_SECONDS}s)"
-    if age > ONLINE_WITHIN_SECONDS:
-        return "Delayed", "Fair", age, f"Last heartbeat {int(age)}s ago, data is going stale"
-    return "Online", "Excellent", age, "Heartbeat received on schedule"
+def collect_system_metrics():
+
+    events = []
+
+    # CPU
+    cpu = psutil.cpu_percent(interval=1)
+
+    events.append(
+        create_telemetry(
+            "CPU Usage",
+            cpu,
+            "percent"
+        )
+    )
+
+    # MEMORY
+    memory = psutil.virtual_memory().percent
+
+    events.append(
+        create_telemetry(
+            "Memory Usage",
+            memory,
+            "percent"
+        )
+    )
+
+    # DISK
+    disk_path = Path.cwd().anchor or str(Path.cwd())
+
+    disk = psutil.disk_usage(disk_path).percent
+
+    events.append(
+        create_telemetry(
+            "Disk Usage",
+            disk,
+            "percent"
+        )
+    )
+
+    return events
 
 
-# --- ENDPOINTS ---
-@app.get("/")
-def home():
-    return {"message": "Smart Observability Backend v2.0 is running!", "status": "success"}
+# ============================================================
+# BACKEND CONNECTIVITY
+# ============================================================
 
+def check_backend():
 
-@app.get("/api/v1/health")
-def health_check():
-    return {"status": "healthy", "service": "Smart Observability API", "version": "2.0.0"}
+    print("\n[CONNECTIVITY] Checking backend...")
 
-
-@app.post("/api/v1/collectors/register")
-def register_collector(collector: CollectorRegistration):
-    now = utc_now()
-    connection = get_db_connection()
     try:
-        connection.execute("""
-            INSERT INTO collectors
-                (tenant_id, region, collector_id, source_id, version, registered_at, last_seen)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(tenant_id, collector_id) DO UPDATE SET
-                region = excluded.region,
-                source_id = excluded.source_id,
-                version = excluded.version,
-                last_seen = excluded.last_seen
-        """, (
-            collector.tenant_id, collector.region, collector.collector_id,
-            collector.source_id, collector.version, now, now
-        ))
-        connection.commit()
-        return {"status": "registered", "collector_id": collector.collector_id, "tenant_id": collector.tenant_id, "region": collector.region}
-    finally:
-        connection.close()
+
+        response = session.get(
+            f"{BACKEND_URL}/",
+            timeout=REQUEST_TIMEOUT
+        )
+
+        if response.status_code == 200:
+
+            print(
+                "[CONNECTIVITY] Backend reachable. HTTP 200"
+            )
+
+            return True
+
+        print(
+            f"[CONNECTIVITY ERROR] HTTP {response.status_code}"
+        )
+
+        return False
+
+    except requests.RequestException as error:
+
+        print(
+            f"[CONNECTIVITY ERROR] {error}"
+        )
+
+        return False
 
 
-@app.post("/api/v1/collectors/heartbeat")
-def collector_heartbeat(heartbeat: CollectorHeartbeat):
-    now = utc_now()
-    connection = get_db_connection()
+# ============================================================
+# COLLECTOR REGISTRATION
+# ============================================================
+
+def register_collector():
+
+    payload = {
+        "collector_id": COLLECTOR_ID,
+        "tenant_id": TENANT_ID,
+        "region": REGION,
+        "source_id": SOURCE_ID,
+        "version": COLLECTOR_VERSION
+    }
+
     try:
-        connection.execute("""
-            INSERT INTO collectors
-                (tenant_id, region, collector_id, version, registered_at, last_seen,
-                 cpu_percent, memory_percent, buffered_events)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(tenant_id, collector_id) DO UPDATE SET
-                region = excluded.region,
-                version = excluded.version,
-                last_seen = excluded.last_seen,
-                cpu_percent = excluded.cpu_percent,
-                memory_percent = excluded.memory_percent,
-                buffered_events = excluded.buffered_events
-        """, (
-            heartbeat.tenant_id, heartbeat.region, heartbeat.collector_id,
-            heartbeat.version, now, now, heartbeat.cpu_percent,
-            heartbeat.memory_percent, heartbeat.buffered_events
-        ))
-        connection.commit()
-        return {"status": "ok", "last_seen": now}
-    finally:
-        connection.close()
+
+        response = session.post(
+            REGISTER_URL,
+            json=payload,
+            timeout=REQUEST_TIMEOUT
+        )
+
+        if response.status_code == 200:
+
+            print("[REGISTRATION] Collector registered successfully.")
+
+            return True
+
+        print(
+            f"[REGISTRATION ERROR] HTTP {response.status_code}: "
+            f"{response.text[:500]}"
+        )
+
+        return False
+
+    except requests.RequestException as error:
+
+        print(f"[REGISTRATION ERROR] {error}")
+
+        return False
 
 
-@app.get("/api/v1/collectors")
-def list_collectors(tenant_id: str):
-    connection = get_db_connection()
+# ============================================================
+# COLLECTOR HEARTBEAT
+# ============================================================
+
+def send_heartbeat():
+
+    payload = {
+        "collector_id": COLLECTOR_ID,
+        "tenant_id": TENANT_ID,
+        "region": REGION,
+        "version": COLLECTOR_VERSION,
+        "cpu_percent": round(
+            psutil.cpu_percent(interval=None),
+            2
+        ),
+        "memory_percent": round(
+            psutil.virtual_memory().percent,
+            2
+        ),
+        "buffered_events": get_buffer_count()
+    }
+
     try:
-        rows = connection.execute("""
-            SELECT * FROM collectors WHERE tenant_id = ? ORDER BY collector_id
-        """, (tenant_id,)).fetchall()
 
-        collectors = []
-        for row in rows:
-            status, health_state, age, reason = collector_status(row["last_seen"])
-            collectors.append({
-                "collector_id": row["collector_id"],
-                "region": row["region"],
-                "source_id": row["source_id"],
-                "version": row["version"],
-                "registered_at": row["registered_at"],
-                "last_seen": row["last_seen"],
-                "seconds_since_last_seen": round(age, 1),
-                "status": status,
-                "health_state": health_state,
-                "reason": reason,
-                "cpu_percent": row["cpu_percent"],
-                "memory_percent": row["memory_percent"],
-                "buffered_events": row["buffered_events"]
-            })
-        return {"tenant_id": tenant_id, "total_collectors": len(collectors), "collectors": collectors}
-    finally:
-        connection.close()
+        response = session.post(
+            HEARTBEAT_URL,
+            json=payload,
+            timeout=REQUEST_TIMEOUT
+        )
+
+        if response.status_code == 200:
+
+            print("[HEARTBEAT] Successfully delivered.")
+
+            return True
+
+        print(
+            f"[HEARTBEAT ERROR] HTTP {response.status_code}: "
+            f"{response.text[:500]}"
+        )
+
+        return False
+
+    except requests.RequestException as error:
+
+        print(f"[HEARTBEAT ERROR] {error}")
+
+        return False
 
 
-@app.post("/api/v1/telemetry/ingest")
-def ingest_telemetry(event: TelemetryEvent):
-    connection = get_db_connection()
+# ============================================================
+# TELEMETRY DELIVERY
+# ============================================================
+
+def send_event(payload):
+
     try:
-        # TRUE IDEMPOTENCY: INSERT OR IGNORE prevents duplicates without breaking collector retry loops
-        cursor = connection.execute("""
-            INSERT OR IGNORE INTO telemetry VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            event.payload_id,
-            event.tenant_id,
-            event.region,
-            event.source_id,
-            event.timestamp.isoformat(),
-            event.source_timezone,
-            event.metric_name,
-            event.metric_value,
-            event.metric_unit,
-            event.health_state,
-            event.event_category,
-            event.severity,
-            event.alert_context
-        ))
-        connection.commit()
 
-        if cursor.rowcount == 0:
-            return {
-                "status": "duplicate_ignored",
-                "message": "Payload already processed (idempotent retry safe)",
-                "payload_id": event.payload_id,
-                "tenant_id": event.tenant_id
-            }
+        response = session.post(
+            TELEMETRY_URL,
+            json=payload,
+            timeout=REQUEST_TIMEOUT
+        )
 
-        return {
-            "status": "accepted",
-            "message": "Telemetry saved to database",
-            "payload_id": event.payload_id,
-            "tenant_id": event.tenant_id
-        }
-    finally:
-        connection.close()
+        print(
+            f"[DELIVERY] {payload['metric_name']} "
+            f"| HTTP {response.status_code}"
+        )
 
+        if response.status_code in (200, 201):
 
-@app.get("/api/v1/telemetry")
-def get_telemetry(tenant_id: str, limit: int = 500):
-    connection = get_db_connection()
-    try:
-        # Ordered by UTC event timestamp so out-of-order arrivals render chronologically
-        rows = connection.execute("""
-            SELECT * FROM telemetry
-            WHERE tenant_id = ?
-            ORDER BY timestamp DESC
-            LIMIT ?
-        """, (tenant_id, limit)).fetchall()
+            try:
+                result = response.json()
+            except ValueError:
+                result = response.text[:500]
 
-        events = [dict(row) for row in rows]
-        return {"tenant_id": tenant_id, "total_events": len(events), "events": events}
-    finally:
-        connection.close()
+            print("[BACKEND RESPONSE]", result)
+
+            return True, None
+
+        if response.status_code == 409:
+
+            print("[DUPLICATE] Payload already exists.")
+
+            return True, None
+
+        error = (
+            f"HTTP {response.status_code}: "
+            f"{response.text[:500]}"
+        )
+
+        print("[DELIVERY ERROR]", error)
+
+        return False, error
+
+    except requests.RequestException as error:
+
+        print("[NETWORK ERROR]", error)
+
+        return False, str(error)
 
 
-@app.get("/api/v1/aiops/analyze")
-def analyze_telemetry(tenant_id: str, limit: int = 200):
-    connection = get_db_connection()
-    try:
-        rows = connection.execute("""
-            SELECT * FROM telemetry
-            WHERE tenant_id = ?
-            ORDER BY timestamp ASC
-            LIMIT ?
-        """, (tenant_id, limit)).fetchall()
+# ============================================================
+# BUFFER DELIVERY
+# ============================================================
 
-        history_by_metric: dict[str, list[float]] = {}
-        results = []
+def flush_buffer():
 
-        for row in rows:
-            m_name = row["metric_name"]
-            m_val = row["metric_value"]
-            history = history_by_metric.setdefault(m_name, [])
+    pending = get_pending_events()
 
-            analysis = detect_anomaly_with_baseline(m_name, m_val, history)
-            history.append(m_val)
+    if not pending:
+        return
 
-            results.append({
-                "payload_id": row["payload_id"],
-                "source_id": row["source_id"],
-                "timestamp": row["timestamp"],
-                "metric_name": m_name,
-                "metric_value": m_val,
-                "health_state": row["health_state"],
-                **analysis
-            })
+    print(
+        f"\n[BUFFER] Attempting to deliver "
+        f"{len(pending)} queued events..."
+    )
 
-        results.reverse()  # Newest first for UI
-        return {"tenant_id": tenant_id, "total_analyzed": len(results), "results": results}
-    finally:
-        connection.close()
+    for payload_id, payload_json, attempts in pending:
 
+        try:
 
-# --- NEW: CORRELATED INCIDENTS & EXPLAINABLE AIOPS ---
-@app.get("/api/v1/incidents")
-def get_correlated_incidents(tenant_id: str):
-    """Groups related anomalies on the same source_id into single actionable incidents."""
-    analysis_data = analyze_telemetry(tenant_id=tenant_id, limit=200)["results"]
-    anomalies = [r for r in analysis_data if r["anomaly_detected"]]
+            payload = json.loads(payload_json)
 
-    grouped: dict[str, list[dict]] = {}
-    for item in anomalies:
-        grouped.setdefault(item["source_id"], []).append(item)
+        except json.JSONDecodeError as error:
 
-    incidents = []
-    for source_id, signals in grouped.items():
-        categories = list({s["metric_name"] for s in signals})
-        highest_sev = "critical" if any(s["severity"] == "critical" for s in signals) else "warning"
-        confidence = min(98, 65 + (len(signals) * 8))
+            update_failed_event(
+                payload_id,
+                attempts + 1,
+                error
+            )
 
-        # Root-cause synthesis across correlated signals
-        if len(categories) > 1:
-            summary = f"Multi-signal degradation on {source_id}: correlated spikes across {', '.join(categories)}."
-            recommended_action = f"Throttle non-critical workloads on {source_id} and inspect network/process bottlenecks."
+            print(
+                f"[BUFFER ERROR] Invalid payload {payload_id}"
+            )
+
+            continue
+
+        success, error = send_event(payload)
+
+        if success:
+
+            remove_event(payload_id)
+
+            print(
+                f"[DELIVERED] {payload_id}"
+            )
+
         else:
-            summary = signals[0]["reasoning"]
-            recommended_action = signals[0]["recommendation"]
 
-        incidents.append({
-            "incident_id": f"INC-{source_id}-{len(signals)}",
-            "tenant_id": tenant_id,
-            "affected_source": source_id,
-            "severity": highest_sev,
-            "correlated_signal_count": len(signals),
-            "contributing_signals": [
-                {"metric": s["metric_name"], "value": s["metric_value"], "z_score": s["z_score"], "time": s["timestamp"]}
-                for s in signals[:5]
-            ],
-            "confidence_percent": confidence,
-            "explainable_summary": summary,
-            "recommended_action": recommended_action,
-            "remediation_policy": "POLICY-SAFE-01: Requires human approval; rollback snapshot created automatically."
-        })
+            update_failed_event(
+                payload_id,
+                attempts + 1,
+                error
+            )
 
-    return {"tenant_id": tenant_id, "active_incidents": len(incidents), "incidents": incidents}
+            print(
+                f"[BUFFERED] {payload_id} "
+                f"| Attempts: {attempts + 1}"
+            )
+
+    print(
+        f"[BUFFER] Remaining events: {get_buffer_count()}"
+    )
 
 
-# --- NEW: AUTONOMOUS OPS SAFE REMEDIATION & AUDIT TRAIL ---
-@app.post("/api/v1/remediation/approve")
-def approve_remediation(approval: RemediationApproval):
-    connection = get_db_connection()
-    audit_id = f"AUD-{uuid.uuid4().hex[:8].upper()}"
-    now = utc_now()
-    try:
-        connection.execute("""
-            INSERT INTO remediation_audit VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            audit_id,
-            approval.tenant_id,
-            approval.incident_id,
-            approval.action_taken,
-            approval.approved_by,
-            "PASSED (Policy-Bounded & Reversible)",
-            f"Revert {approval.action_taken} via checkpoint-{audit_id}",
-            "EXECUTED_SIMULATED",
-            now
-        ))
-        connection.commit()
-        return {
-            "status": "approved_and_executed",
-            "audit_id": audit_id,
-            "incident_id": approval.incident_id,
-            "policy_check": "PASSED",
-            "rollback_plan": f"Revert {approval.action_taken} via checkpoint-{audit_id}",
-            "executed_at": now
-        }
-    finally:
-        connection.close()
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
+def main():
+
+    print("=" * 60)
+    print("CICADA 2026 - SMART OBSERVABILITY COLLECTOR")
+    print("=" * 60)
+
+    print("Tenant:", TENANT_ID)
+    print("Collector:", COLLECTOR_ID)
+    print("Source:", SOURCE_ID)
+    print("Region:", REGION)
+    print("Backend:", BACKEND_URL)
+
+    initialize_buffer()
+
+    # Initialize CPU measurement.
+    psutil.cpu_percent(interval=None)
+
+    if not check_backend():
+
+        print(
+            "[WARNING] Backend is currently unreachable. "
+            "Telemetry will be buffered."
+        )
+
+    else:
+
+        register_collector()
+
+        send_heartbeat()
+
+    last_heartbeat = time.time()
+
+    print("\n[COLLECTOR] Starting collection...\n")
+
+    while True:
+
+        try:
+
+            # 1. Collect metrics.
+            events = collect_system_metrics()
+
+            # 2. Persist every event before attempting delivery.
+            for event in events:
+
+                enqueue_event(event)
+
+                print(
+                    f"[COLLECTED] {event['metric_name']}: "
+                    f"{event['metric_value']} "
+                    f"{event['metric_unit']} "
+                    f"| Health: {event['health_state']}"
+                )
+
+            print(
+                f"[BUFFER] Total queued: {get_buffer_count()}"
+            )
+
+            # 3. Deliver queued telemetry.
+            flush_buffer()
+
+            # 4. Send periodic heartbeat.
+            if (
+                time.time() - last_heartbeat
+                >= HEARTBEAT_INTERVAL
+            ):
+
+                send_heartbeat()
+
+                last_heartbeat = time.time()
+
+            print(
+                f"\n[WAITING] Next collection in "
+                f"{COLLECTION_INTERVAL} seconds...\n"
+            )
+
+            time.sleep(COLLECTION_INTERVAL)
+
+        except KeyboardInterrupt:
+
+            print("\n[COLLECTOR] Stopped.")
+
+            print(
+                "[BUFFER] Preserved queued events:",
+                get_buffer_count()
+            )
+
+            break
+
+        except Exception as error:
+
+            print(
+                f"[COLLECTOR ERROR] "
+                f"{type(error).__name__}: {error}"
+            )
+
+            time.sleep(5)
+
+    session.close()
 
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("backend:app", host="127.0.0.1", port=8000, reload=True)
+    main()
