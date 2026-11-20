@@ -22,6 +22,7 @@ TELEMETRY_URL = f"{BACKEND_URL}/api/v1/telemetry/ingest"
 
 TENANT_ID = "customer-001"
 COLLECTOR_ID = "collector-001"
+REGION = "ap-south-1"
 
 COLLECTION_INTERVAL = 5
 REQUEST_TIMEOUT = 10
@@ -32,11 +33,15 @@ BASE_DIR = Path(__file__).resolve().parent
 BUFFER_DB = BASE_DIR / "collector_buffer.db"
 
 HOSTNAME = socket.gethostname()
+OS_NAME = platform.system()
+
+COLLECTOR_API_TOKEN = "cicada-2026-secure-collector-key"
 
 session = requests.Session()
 session.headers.update({
     "Content-Type": "application/json",
-    "Accept": "application/json"
+    "Accept": "application/json",
+    "X-Collector-Token": COLLECTOR_API_TOKEN
 })
 
 
@@ -45,9 +50,7 @@ session.headers.update({
 # ============================================================
 
 def initialize_buffer():
-
     with sqlite3.connect(BUFFER_DB) as conn:
-
         conn.execute("""
             CREATE TABLE IF NOT EXISTS telemetry_buffer (
                 payload_id TEXT PRIMARY KEY,
@@ -58,18 +61,15 @@ def initialize_buffer():
                 created_at REAL NOT NULL
             )
         """)
-
         conn.commit()
 
     print("[BUFFER] Persistent telemetry buffer initialized.")
 
 
 def enqueue_event(payload):
-
     payload_json = json.dumps(payload)
 
     with sqlite3.connect(BUFFER_DB) as conn:
-
         conn.execute("""
             INSERT OR IGNORE INTO telemetry_buffer
             (payload_id, payload, attempts, next_attempt, last_error, created_at)
@@ -79,14 +79,11 @@ def enqueue_event(payload):
             payload_json,
             time.time()
         ))
-
         conn.commit()
 
 
 def get_buffer_count():
-
     with sqlite3.connect(BUFFER_DB) as conn:
-
         result = conn.execute(
             "SELECT COUNT(*) FROM telemetry_buffer"
         ).fetchone()
@@ -95,26 +92,21 @@ def get_buffer_count():
 
 
 def remove_event(payload_id):
-
     with sqlite3.connect(BUFFER_DB) as conn:
-
         conn.execute(
             "DELETE FROM telemetry_buffer WHERE payload_id = ?",
             (payload_id,)
         )
-
         conn.commit()
 
 
 def update_failed_event(payload_id, attempts, error):
-
     retry_delay = min(
         2 ** min(attempts, 6),
         MAX_RETRY_DELAY
     )
 
     with sqlite3.connect(BUFFER_DB) as conn:
-
         conn.execute("""
             UPDATE telemetry_buffer
             SET attempts = ?,
@@ -127,14 +119,11 @@ def update_failed_event(payload_id, attempts, error):
             str(error)[:1000],
             payload_id
         ))
-
         conn.commit()
 
 
 def get_pending_events():
-
     with sqlite3.connect(BUFFER_DB) as conn:
-
         rows = conn.execute("""
             SELECT payload_id, payload, attempts
             FROM telemetry_buffer
@@ -166,11 +155,9 @@ SECRET_PATTERN = re.compile(
 def redact_sensitive_data(value):
 
     if isinstance(value, dict):
-
         cleaned = {}
 
         for key, item in value.items():
-
             key_lower = str(key).lower()
 
             if any(word in key_lower for word in [
@@ -186,14 +173,12 @@ def redact_sensitive_data(value):
         return cleaned
 
     if isinstance(value, list):
-
         return [
             redact_sensitive_data(item)
             for item in value
         ]
 
     if isinstance(value, str):
-
         value = EMAIL_PATTERN.sub(
             "[REDACTED_EMAIL]",
             value
@@ -210,65 +195,160 @@ def redact_sensitive_data(value):
 
 
 # ============================================================
-# TELEMETRY GENERATION
+# TELEMETRY HEALTH CLASSIFICATION
 # ============================================================
 
 def get_metric_health(value):
 
     if value >= 90:
-        return "Critical", "critical"
+        return "Poor", "critical"
 
     if value >= 75:
-        return "Warning", "warning"
+        return "Fair", "warning"
 
-    return "Healthy", "info"
+    if value >= 50:
+        return "Good", "info"
 
+    return "Excellent", "info"
+
+
+# ============================================================
+# TELEMETRY GENERATION
+# ============================================================
 
 def create_telemetry(metric_name, metric_value, metric_unit):
 
-    health_state, severity = get_metric_health(
-        metric_value
-    )
+    metric_value = round(float(metric_value), 2)
+
+    health_state, severity = get_metric_health(metric_value)
 
     payload = {
         "payload_id": str(uuid.uuid4()),
-
         "tenant_id": TENANT_ID,
-
+        "region": REGION,
         "source_id": COLLECTOR_ID,
 
         "timestamp": datetime.now(
             timezone.utc
         ).isoformat(timespec="seconds"),
 
+        "source_timezone": "UTC",
+
         "metric_name": metric_name,
-
-        "metric_value": round(float(metric_value), 2),
-
+        "metric_value": metric_value,
         "metric_unit": metric_unit,
 
         "health_state": health_state,
-
-        "event_category": "system_metric",
-
+        "event_category": "infrastructure",
         "severity": severity,
 
-        "alert_context": {
-            "collector_id": COLLECTOR_ID,
-            "hostname": HOSTNAME,
-            "operating_system": platform.system(),
-            "description": f"{metric_name} telemetry"
-        }
+        # Backend expects Optional[str], NOT a dictionary.
+        "alert_context": (
+            f"Collector: {COLLECTOR_ID}; "
+            f"Hostname: {HOSTNAME}; "
+            f"OS: {OS_NAME}; "
+            f"Description: {metric_name} telemetry"
+        )
     }
 
     return redact_sensitive_data(payload)
 
 
+# ============================================================
+# LEGACY BUFFER PAYLOAD COMPATIBILITY
+# ============================================================
+
+def normalize_legacy_payload(payload):
+
+    payload.setdefault("tenant_id", TENANT_ID)
+    payload.setdefault("region", REGION)
+    payload.setdefault("source_id", COLLECTOR_ID)
+    payload.setdefault("source_timezone", "UTC")
+
+    if "timestamp" not in payload:
+        payload["timestamp"] = datetime.now(
+            timezone.utc
+        ).isoformat(timespec="seconds")
+
+    if "metric_value" not in payload:
+        raise ValueError("Missing metric_value in buffered event")
+
+    value = float(payload["metric_value"])
+    payload["metric_value"] = round(value, 2)
+
+    # Normalize health state.
+    old_health = str(
+        payload.get("health_state", "")
+    ).lower()
+
+    health_mapping = {
+        "healthy": "Excellent",
+        "excellent": "Excellent",
+        "good": "Good",
+        "warning": "Fair",
+        "fair": "Fair",
+        "critical": "Poor",
+        "poor": "Poor"
+    }
+
+    if old_health in health_mapping:
+        payload["health_state"] = health_mapping[old_health]
+    else:
+        payload["health_state"] = get_metric_health(value)[0]
+
+    # Normalize event category.
+    old_category = str(
+        payload.get("event_category", "")
+    ).lower()
+
+    category_mapping = {
+        "system_metric": "infrastructure",
+        "infrastructure": "infrastructure",
+        "network": "network",
+        "security": "security",
+        "collector": "collector"
+    }
+
+    payload["event_category"] = category_mapping.get(
+        old_category,
+        "infrastructure"
+    )
+
+    # Normalize severity.
+    if payload.get("severity") not in (
+        "info",
+        "warning",
+        "critical"
+    ):
+        payload["severity"] = get_metric_health(value)[1]
+
+    payload.setdefault("metric_unit", "percent")
+    payload.setdefault("metric_name", "Unknown Metric")
+
+    # CRITICAL FIX:
+    # Convert previously buffered dictionaries into strings.
+    alert_context = payload.get("alert_context")
+
+    if isinstance(alert_context, (dict, list)):
+        payload["alert_context"] = json.dumps(
+            alert_context,
+            ensure_ascii=False
+        )
+
+    elif alert_context is not None and not isinstance(alert_context, str):
+        payload["alert_context"] = str(alert_context)
+
+    return redact_sensitive_data(payload)
+
+
+# ============================================================
+# SYSTEM METRIC COLLECTION
+# ============================================================
+
 def collect_system_metrics():
 
     metrics = []
 
-    # CPU usage
     cpu_usage = psutil.cpu_percent(interval=None)
 
     metrics.append(
@@ -279,7 +359,6 @@ def collect_system_metrics():
         )
     )
 
-    # Memory usage
     memory_usage = psutil.virtual_memory().percent
 
     metrics.append(
@@ -290,8 +369,7 @@ def collect_system_metrics():
         )
     )
 
-    # Disk usage
-    disk_path = Path.cwd().anchor or str(Path.cwd())
+    disk_path = Path.home().anchor or str(Path.cwd())
 
     disk_usage = psutil.disk_usage(disk_path).percent
 
@@ -315,7 +393,6 @@ def check_backend_connection():
     print("\n[CONNECTIVITY] Checking backend...")
 
     try:
-
         response = session.get(
             f"{BACKEND_URL}/docs",
             timeout=REQUEST_TIMEOUT
@@ -326,14 +403,10 @@ def check_backend_connection():
             f"HTTP {response.status_code}"
         )
 
-        return True
+        return response.ok
 
     except requests.RequestException as error:
-
-        print(
-            f"[CONNECTIVITY ERROR] {error}"
-        )
-
+        print(f"[CONNECTIVITY ERROR] {error}")
         return False
 
 
@@ -344,7 +417,6 @@ def check_backend_connection():
 def send_event(payload):
 
     try:
-
         response = session.post(
             TELEMETRY_URL,
             json=payload,
@@ -356,32 +428,21 @@ def send_event(payload):
             f"| HTTP {response.status_code}"
         )
 
-        if response.status_code in (200, 201):
-
+        if response.status_code in (200, 201, 202):
             try:
-                print(
-                    "[BACKEND RESPONSE]",
-                    response.json()
-                )
+                print("[BACKEND RESPONSE]", response.json())
             except ValueError:
-                print(
-                    "[BACKEND RESPONSE]",
-                    response.text[:500]
-                )
+                print("[BACKEND RESPONSE]", response.text[:500])
 
             return "accepted", None
 
         if response.status_code == 409:
-
-            print(
-                "[DUPLICATE] Backend already has this payload."
-            )
-
+            print("[DUPLICATE] Backend already has this payload.")
             return "duplicate", None
 
         error = (
             f"HTTP {response.status_code}: "
-            f"{response.text[:500]}"
+            f"{response.text[:1000]}"
         )
 
         print("[DELIVERY ERROR]", error)
@@ -389,12 +450,13 @@ def send_event(payload):
         return "failed", error
 
     except requests.RequestException as error:
-
-        print(
-            f"[NETWORK ERROR] {type(error).__name__}: {error}"
+        error_message = (
+            f"{type(error).__name__}: {error}"
         )
 
-        return "failed", str(error)
+        print("[NETWORK ERROR]", error_message)
+
+        return "failed", error_message
 
 
 # ============================================================
@@ -416,17 +478,18 @@ def flush_buffer():
     for payload_id, payload_json, attempts in pending:
 
         try:
-
             payload = json.loads(payload_json)
 
-        except json.JSONDecodeError as error:
+            # Convert older payloads to the current backend schema.
+            payload = normalize_legacy_payload(payload)
+
+        except (json.JSONDecodeError, ValueError, TypeError) as error:
 
             print(
                 f"[BUFFER ERROR] Invalid stored payload "
                 f"{payload_id}: {error}"
             )
 
-            # Do not silently delete potentially recoverable data.
             update_failed_event(
                 payload_id,
                 attempts + 1,
@@ -441,9 +504,7 @@ def flush_buffer():
 
             remove_event(payload_id)
 
-            print(
-                f"[DELIVERED] {payload_id}"
-            )
+            print(f"[DELIVERED] {payload_id}")
 
         else:
 
@@ -476,6 +537,7 @@ def main():
 
     print(f"Tenant ID: {TENANT_ID}")
     print(f"Collector ID: {COLLECTOR_ID}")
+    print(f"Region: {REGION}")
     print(f"Backend: {BACKEND_URL}")
     print(f"Buffer database: {BUFFER_DB}")
 
@@ -484,66 +546,66 @@ def main():
     # Prime CPU measurement.
     psutil.cpu_percent(interval=1)
 
-    check_backend_connection()
+    if not check_backend_connection():
+        print(
+            "[WARNING] Backend is not responding successfully. "
+            "Telemetry will remain buffered."
+        )
 
     print("\n[COLLECTOR] Starting telemetry collection...\n")
 
-    while True:
+    try:
+        while True:
 
-        try:
+            try:
+                events = collect_system_metrics()
 
-            # Collect new system metrics.
-            events = collect_system_metrics()
+                # Save every event before transmission.
+                for event in events:
+                    enqueue_event(event)
 
-            # Save every event locally before transmission.
-            for event in events:
-
-                enqueue_event(event)
+                    print(
+                        f"[COLLECTED] "
+                        f"{event['metric_name']}: "
+                        f"{event['metric_value']} "
+                        f"{event['metric_unit']}"
+                    )
 
                 print(
-                    f"[COLLECTED] "
-                    f"{event['metric_name']}: "
-                    f"{event['metric_value']} "
-                    f"{event['metric_unit']}"
+                    f"[BUFFER] Total queued: {get_buffer_count()}"
                 )
 
-            print(
-                f"[BUFFER] Total queued: {get_buffer_count()}"
-            )
+                flush_buffer()
 
-            # Attempt delivery of queued events.
-            flush_buffer()
+                print(
+                    f"\n[WAITING] Next collection in "
+                    f"{COLLECTION_INTERVAL} seconds...\n"
+                )
 
-            print(
-                f"\n[WAITING] Next collection in "
-                f"{COLLECTION_INTERVAL} seconds...\n"
-            )
+                time.sleep(COLLECTION_INTERVAL)
 
-            time.sleep(COLLECTION_INTERVAL)
+            except KeyboardInterrupt:
+                raise
 
-        except KeyboardInterrupt:
+            except Exception as error:
+                print(
+                    f"[COLLECTOR ERROR] "
+                    f"{type(error).__name__}: {error}"
+                )
 
-            print("\n[COLLECTOR] Stopped by user.")
+                print("[COLLECTOR] Retrying after 5 seconds...")
+                time.sleep(5)
 
-            print(
-                f"[BUFFER] Undelivered events preserved: "
-                f"{get_buffer_count()}"
-            )
+    except KeyboardInterrupt:
+        print("\n[COLLECTOR] Stopped by user.")
 
-            break
+        print(
+            f"[BUFFER] Undelivered events preserved: "
+            f"{get_buffer_count()}"
+        )
 
-        except Exception as error:
-
-            print(
-                f"[COLLECTOR ERROR] "
-                f"{type(error).__name__}: {error}"
-            )
-
-            print("[COLLECTOR] Retrying after 5 seconds...")
-
-            time.sleep(5)
-
-    session.close()
+    finally:
+        session.close()
 
 
 if __name__ == "__main__":
