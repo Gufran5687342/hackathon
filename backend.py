@@ -1,632 +1,1158 @@
 
-import json
 import sqlite3
-import time
+import json
 import uuid
-import socket
-import platform
+import os
+import joblib
+
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Literal
 
-import requests
-import psutil
+from fastapi import FastAPI, HTTPException, Header, Depends, Query
+from pydantic import BaseModel, ConfigDict, Field
+
+from sklearn.ensemble import IsolationForest
+import numpy as np
 
 
 # ============================================================
-# CONFIGURATION — MUST MATCH BACKEND
+# CONFIGURATION
 # ============================================================
-
-BACKEND_URL = "http://127.0.0.1:8000"
-
-TENANT_ID = "customer-001"
-COLLECTOR_ID = "collector-001"
-SOURCE_ID = socket.gethostname()
-
-REGION = "ap-south-1"
-COLLECTOR_VERSION = "1.0.0"
-
-# Exact token from backend.py
-COLLECTOR_API_TOKEN = "cicada-2026-secure-collector-key"
-
-TELEMETRY_URL = f"{BACKEND_URL}/api/v1/telemetry/ingest"
-REGISTER_URL = f"{BACKEND_URL}/api/v1/collectors/register"
-HEARTBEAT_URL = f"{BACKEND_URL}/api/v1/collectors/heartbeat"
-
-COLLECTION_INTERVAL = 5
-REQUEST_TIMEOUT = 10
-MAX_BATCH_SIZE = 50
-HEARTBEAT_INTERVAL = 20
 
 BASE_DIR = Path(__file__).resolve().parent
-BUFFER_DB = BASE_DIR / "collector_buffer.db"
 
-session = requests.Session()
+DATABASE_NAME = BASE_DIR / "telemetry.db"
+MODEL_DIR = BASE_DIR / "ml_models"
 
-session.headers.update({
-    "Content-Type": "application/json",
-    "Accept": "application/json",
-    "X-Collector-Token": COLLECTOR_API_TOKEN
-})
+MODEL_DIR.mkdir(exist_ok=True)
+
+COLLECTOR_API_TOKEN = "cicada-2026-secure-collector-key"
+
+MINIMUM_TRAINING_SAMPLES = 20
+DEFAULT_CONTAMINATION = 0.05
+
+app = FastAPI(
+    title="CICADA 2026 - Smart Observability Platform",
+    description="Secure AI-powered observability backend with ML anomaly detection",
+    version="2.0.0"
+)
 
 
 # ============================================================
-# DATABASE / BUFFER
+# DATABASE CONNECTION
 # ============================================================
 
-def initialize_buffer():
+def get_db():
+    conn = sqlite3.connect(DATABASE_NAME)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
 
-    with sqlite3.connect(BUFFER_DB) as conn:
+
+def initialize_database():
+    with get_db() as conn:
 
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS telemetry_buffer (
-                payload_id TEXT PRIMARY KEY,
-                payload TEXT NOT NULL,
-                attempts INTEGER DEFAULT 0,
-                next_attempt REAL DEFAULT 0,
-                last_error TEXT DEFAULT '',
-                created_at REAL NOT NULL
+            CREATE TABLE IF NOT EXISTS telemetry (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                payload_id TEXT UNIQUE NOT NULL,
+                tenant_id TEXT NOT NULL,
+                region TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                source_timezone TEXT,
+                metric_name TEXT NOT NULL,
+                metric_value REAL NOT NULL,
+                metric_unit TEXT,
+                health_state TEXT,
+                event_category TEXT,
+                severity TEXT,
+                alert_context TEXT
             )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS collectors (
+                collector_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                region TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                version TEXT,
+                status TEXT DEFAULT 'Offline',
+                last_heartbeat TEXT,
+                cpu_percent REAL,
+                memory_percent REAL,
+                buffered_events INTEGER DEFAULT 0
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS incidents (
+                incident_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT,
+                severity TEXT,
+                status TEXT DEFAULT 'Open',
+                metric_name TEXT,
+                source_id TEXT,
+                occurrence_count INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS remediation_audit (
+                audit_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                incident_id TEXT,
+                action TEXT NOT NULL,
+                approved_by TEXT,
+                status TEXT NOT NULL,
+                details TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_telemetry_tenant
+            ON telemetry(tenant_id)
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_telemetry_metric
+            ON telemetry(tenant_id, metric_name)
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_incidents_tenant
+            ON incidents(tenant_id)
         """)
 
         conn.commit()
 
-    print("[BUFFER] Persistent buffer initialized.")
+    print("[DATABASE] Database initialized successfully.")
 
 
-def enqueue_event(payload):
-
-    with sqlite3.connect(BUFFER_DB) as conn:
-
-        conn.execute("""
-            INSERT OR IGNORE INTO telemetry_buffer
-            (payload_id, payload, attempts, next_attempt,
-             last_error, created_at)
-            VALUES (?, ?, 0, 0, '', ?)
-        """, (
-            payload["payload_id"],
-            json.dumps(payload),
-            time.time()
-        ))
-
-        conn.commit()
+@app.on_event("startup")
+def startup_event():
+    initialize_database()
 
 
-def get_buffer_count():
+# ============================================================
+# AUTHENTICATION
+# ============================================================
 
-    with sqlite3.connect(BUFFER_DB) as conn:
+def verify_collector_token(
+    x_collector_token: Optional[str] = Header(default=None)
+):
+    if x_collector_token != COLLECTOR_API_TOKEN:
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized collector: invalid or missing X-Collector-Token"
+        )
 
-        result = conn.execute(
-            "SELECT COUNT(*) FROM telemetry_buffer"
+    return True
+
+
+# ============================================================
+# PYDANTIC MODELS
+# ============================================================
+
+class TelemetryEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    payload_id: str
+    tenant_id: str
+    region: str = "ap-south-1"
+    source_id: str
+    timestamp: datetime
+
+    source_timezone: str = "UTC"
+
+    metric_name: str
+    metric_value: float
+    metric_unit: str
+
+    health_state: Literal[
+        "Excellent",
+        "Good",
+        "Fair",
+        "Poor"
+    ]
+
+    event_category: Literal[
+        "infrastructure",
+        "network",
+        "security",
+        "collector"
+    ]
+
+    severity: Literal[
+        "info",
+        "warning",
+        "critical"
+    ]
+
+    alert_context: Optional[str] = None
+
+
+class CollectorRegistration(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    collector_id: str
+    tenant_id: str
+    region: str = "ap-south-1"
+    source_id: str
+    version: str
+
+
+class CollectorHeartbeat(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    collector_id: str
+    tenant_id: str
+    region: str = "ap-south-1"
+    version: str
+
+    cpu_percent: Optional[float] = None
+    memory_percent: Optional[float] = None
+    buffered_events: Optional[int] = None
+
+
+class IncidentStatusUpdate(BaseModel):
+    status: Literal[
+        "Open",
+        "Acknowledged",
+        "Investigating",
+        "Resolved",
+        "Closed"
+    ]
+
+
+class RemediationApproval(BaseModel):
+    tenant_id: str
+    incident_id: str
+    action: str
+    approved_by: str
+
+
+# ============================================================
+# UTILITY FUNCTIONS
+# ============================================================
+
+def current_time():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def row_to_dict(row):
+    return dict(row) if row else None
+
+
+# ============================================================
+# ROOT AND HEALTH
+# ============================================================
+
+@app.get("/")
+def root():
+    return {
+        "platform": "CICADA 2026",
+        "name": "Smart Observability Platform",
+        "status": "running",
+        "version": "2.0.0",
+        "features": [
+            "Telemetry ingestion",
+            "Collector monitoring",
+            "Incident management",
+            "ML anomaly detection",
+            "Remediation audit"
+        ]
+    }
+
+
+@app.get("/api/v1/health")
+def health_check():
+    try:
+        with get_db() as conn:
+            conn.execute("SELECT 1")
+
+        return {
+            "status": "healthy",
+            "database": "connected",
+            "timestamp": current_time()
+        }
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=str(error)
+        )
+
+
+# ============================================================
+# TELEMETRY INGESTION
+# ============================================================
+
+@app.post(
+    "/api/v1/telemetry/ingest",
+    dependencies=[Depends(verify_collector_token)]
+)
+def ingest_telemetry(event: TelemetryEvent):
+
+    with get_db() as conn:
+
+        existing = conn.execute(
+            "SELECT payload_id FROM telemetry WHERE payload_id = ?",
+            (event.payload_id,)
         ).fetchone()
 
-    return result[0]
-
-
-def get_pending_events():
-
-    with sqlite3.connect(BUFFER_DB) as conn:
-
-        rows = conn.execute("""
-            SELECT payload_id, payload, attempts
-            FROM telemetry_buffer
-            WHERE next_attempt <= ?
-            ORDER BY created_at ASC
-            LIMIT ?
-        """, (
-            time.time(),
-            MAX_BATCH_SIZE
-        )).fetchall()
-
-    return rows
-
-
-def remove_event(payload_id):
-
-    with sqlite3.connect(BUFFER_DB) as conn:
+        if existing:
+            return {
+                "message": "Duplicate telemetry event",
+                "payload_id": event.payload_id
+            }
 
         conn.execute("""
-            DELETE FROM telemetry_buffer
-            WHERE payload_id = ?
-        """, (payload_id,))
-
-        conn.commit()
-
-
-def update_failed_event(payload_id, attempts, error):
-
-    delay = min(
-        2 ** min(attempts, 6),
-        60
-    )
-
-    with sqlite3.connect(BUFFER_DB) as conn:
-
-        conn.execute("""
-            UPDATE telemetry_buffer
-            SET attempts = ?,
-                next_attempt = ?,
-                last_error = ?
-            WHERE payload_id = ?
+            INSERT INTO telemetry (
+                payload_id,
+                tenant_id,
+                region,
+                source_id,
+                timestamp,
+                source_timezone,
+                metric_name,
+                metric_value,
+                metric_unit,
+                health_state,
+                event_category,
+                severity,
+                alert_context
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            attempts,
-            time.time() + delay,
-            str(error)[:1000],
-            payload_id
+            event.payload_id,
+            event.tenant_id,
+            event.region,
+            event.source_id,
+            event.timestamp.isoformat(),
+            event.source_timezone,
+            event.metric_name,
+            event.metric_value,
+            event.metric_unit,
+            event.health_state,
+            event.event_category,
+            event.severity,
+            event.alert_context
         ))
 
         conn.commit()
 
+    incident_created = None
 
-# ============================================================
-# HEALTH AND SEVERITY
-# Must match backend Pydantic Literal values.
-# ============================================================
-
-def get_health_state(value):
-
-    if value >= 90:
-        return "Poor"
-
-    if value >= 75:
-        return "Fair"
-
-    if value >= 50:
-        return "Good"
-
-    return "Excellent"
-
-
-def get_severity(value):
-
-    if value >= 90:
-        return "critical"
-
-    if value >= 75:
-        return "warning"
-
-    return "info"
-
-
-# ============================================================
-# TELEMETRY PAYLOAD
-# Must match TelemetryEvent in backend.py.
-# ============================================================
-
-def create_telemetry(metric_name, metric_value, metric_unit):
-
-    metric_value = round(float(metric_value), 2)
+    if event.severity in ("warning", "critical"):
+        incident_created = create_or_update_incident(event)
 
     return {
-        "payload_id": str(uuid.uuid4()),
-
-        "tenant_id": TENANT_ID,
-
-        "region": REGION,
-
-        "source_id": SOURCE_ID,
-
-        "timestamp": datetime.now(
-            timezone.utc
-        ).isoformat(),
-
-        "source_timezone": "UTC",
-
-        "metric_name": metric_name,
-
-        "metric_value": metric_value,
-
-        "metric_unit": metric_unit,
-
-        "health_state": get_health_state(metric_value),
-
-        "event_category": "infrastructure",
-
-        "severity": get_severity(metric_value),
-
-        "alert_context": (
-            f"Collector: {COLLECTOR_ID}; "
-            f"Host: {SOURCE_ID}; "
-            f"OS: {platform.system()}; "
-            f"Metric: {metric_name}"
-        )
+        "message": "Telemetry ingested successfully",
+        "payload_id": event.payload_id,
+        "tenant_id": event.tenant_id,
+        "incident": incident_created
     }
 
 
 # ============================================================
-# SYSTEM METRICS
+# TELEMETRY RETRIEVAL
 # ============================================================
 
-def collect_system_metrics():
+@app.get("/api/v1/telemetry")
+def get_telemetry(
+    tenant_id: str,
+    limit: int = Query(default=100, ge=1, le=10000)
+):
 
-    events = []
+    with get_db() as conn:
 
-    # CPU
-    cpu = psutil.cpu_percent(interval=1)
+        rows = conn.execute("""
+            SELECT *
+            FROM telemetry
+            WHERE tenant_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+        """, (tenant_id, limit)).fetchall()
 
-    events.append(
-        create_telemetry(
-            "CPU Usage",
-            cpu,
-            "percent"
-        )
-    )
-
-    # MEMORY
-    memory = psutil.virtual_memory().percent
-
-    events.append(
-        create_telemetry(
-            "Memory Usage",
-            memory,
-            "percent"
-        )
-    )
-
-    # DISK
-    disk_path = Path.cwd().anchor or str(Path.cwd())
-
-    disk = psutil.disk_usage(disk_path).percent
-
-    events.append(
-        create_telemetry(
-            "Disk Usage",
-            disk,
-            "percent"
-        )
-    )
-
-    return events
-
-
-# ============================================================
-# BACKEND CONNECTIVITY
-# ============================================================
-
-def check_backend():
-
-    print("\n[CONNECTIVITY] Checking backend...")
-
-    try:
-
-        response = session.get(
-            f"{BACKEND_URL}/",
-            timeout=REQUEST_TIMEOUT
-        )
-
-        if response.status_code == 200:
-
-            print(
-                "[CONNECTIVITY] Backend reachable. HTTP 200"
-            )
-
-            return True
-
-        print(
-            f"[CONNECTIVITY ERROR] HTTP {response.status_code}"
-        )
-
-        return False
-
-    except requests.RequestException as error:
-
-        print(
-            f"[CONNECTIVITY ERROR] {error}"
-        )
-
-        return False
+    return {
+        "tenant_id": tenant_id,
+        "total_returned": len(rows),
+        "results": [dict(row) for row in rows]
+    }
 
 
 # ============================================================
 # COLLECTOR REGISTRATION
 # ============================================================
 
-def register_collector():
+@app.post(
+    "/api/v1/collectors/register",
+    dependencies=[Depends(verify_collector_token)]
+)
+def register_collector(collector: CollectorRegistration):
 
-    payload = {
-        "collector_id": COLLECTOR_ID,
-        "tenant_id": TENANT_ID,
-        "region": REGION,
-        "source_id": SOURCE_ID,
-        "version": COLLECTOR_VERSION
+    with get_db() as conn:
+
+        existing = conn.execute("""
+            SELECT collector_id
+            FROM collectors
+            WHERE collector_id = ?
+        """, (collector.collector_id,)).fetchone()
+
+        if existing:
+
+            conn.execute("""
+                UPDATE collectors
+                SET tenant_id = ?,
+                    region = ?,
+                    source_id = ?,
+                    version = ?
+                WHERE collector_id = ?
+            """, (
+                collector.tenant_id,
+                collector.region,
+                collector.source_id,
+                collector.version,
+                collector.collector_id
+            ))
+
+        else:
+
+            conn.execute("""
+                INSERT INTO collectors (
+                    collector_id,
+                    tenant_id,
+                    region,
+                    source_id,
+                    version,
+                    status
+                )
+                VALUES (?, ?, ?, ?, ?, 'Offline')
+            """, (
+                collector.collector_id,
+                collector.tenant_id,
+                collector.region,
+                collector.source_id,
+                collector.version
+            ))
+
+        conn.commit()
+
+    return {
+        "message": "Collector registered successfully",
+        "collector_id": collector.collector_id,
+        "tenant_id": collector.tenant_id
     }
-
-    try:
-
-        response = session.post(
-            REGISTER_URL,
-            json=payload,
-            timeout=REQUEST_TIMEOUT
-        )
-
-        if response.status_code == 200:
-
-            print("[REGISTRATION] Collector registered successfully.")
-
-            return True
-
-        print(
-            f"[REGISTRATION ERROR] HTTP {response.status_code}: "
-            f"{response.text[:500]}"
-        )
-
-        return False
-
-    except requests.RequestException as error:
-
-        print(f"[REGISTRATION ERROR] {error}")
-
-        return False
 
 
 # ============================================================
 # COLLECTOR HEARTBEAT
 # ============================================================
 
-def send_heartbeat():
+@app.post(
+    "/api/v1/collectors/heartbeat",
+    dependencies=[Depends(verify_collector_token)]
+)
+def collector_heartbeat(heartbeat: CollectorHeartbeat):
 
-    payload = {
-        "collector_id": COLLECTOR_ID,
-        "tenant_id": TENANT_ID,
-        "region": REGION,
-        "version": COLLECTOR_VERSION,
-        "cpu_percent": round(
-            psutil.cpu_percent(interval=None),
-            2
-        ),
-        "memory_percent": round(
-            psutil.virtual_memory().percent,
-            2
-        ),
-        "buffered_events": get_buffer_count()
+    with get_db() as conn:
+
+        collector = conn.execute("""
+            SELECT collector_id
+            FROM collectors
+            WHERE collector_id = ?
+            AND tenant_id = ?
+        """, (
+            heartbeat.collector_id,
+            heartbeat.tenant_id
+        )).fetchone()
+
+        if not collector:
+            raise HTTPException(
+                status_code=404,
+                detail="Collector not registered"
+            )
+
+        conn.execute("""
+            UPDATE collectors
+            SET region = ?,
+                version = ?,
+                status = 'Online',
+                last_heartbeat = ?,
+                cpu_percent = ?,
+                memory_percent = ?,
+                buffered_events = ?
+            WHERE collector_id = ?
+            AND tenant_id = ?
+        """, (
+            heartbeat.region,
+            heartbeat.version,
+            current_time(),
+            heartbeat.cpu_percent,
+            heartbeat.memory_percent,
+            heartbeat.buffered_events,
+            heartbeat.collector_id,
+            heartbeat.tenant_id
+        ))
+
+        conn.commit()
+
+    return {
+        "message": "Heartbeat received successfully",
+        "collector_id": heartbeat.collector_id,
+        "status": "Online"
     }
 
-    try:
-
-        response = session.post(
-            HEARTBEAT_URL,
-            json=payload,
-            timeout=REQUEST_TIMEOUT
-        )
-
-        if response.status_code == 200:
-
-            print("[HEARTBEAT] Successfully delivered.")
-
-            return True
-
-        print(
-            f"[HEARTBEAT ERROR] HTTP {response.status_code}: "
-            f"{response.text[:500]}"
-        )
-
-        return False
-
-    except requests.RequestException as error:
-
-        print(f"[HEARTBEAT ERROR] {error}")
-
-        return False
-
 
 # ============================================================
-# TELEMETRY DELIVERY
+# COLLECTOR MONITORING
 # ============================================================
 
-def send_event(payload):
+@app.get("/api/v1/collectors")
+def list_collectors(
+    tenant_id: str,
+    offline_threshold_seconds: int = 60
+):
 
-    try:
+    now = datetime.now(timezone.utc)
 
-        response = session.post(
-            TELEMETRY_URL,
-            json=payload,
-            timeout=REQUEST_TIMEOUT
-        )
+    with get_db() as conn:
 
-        print(
-            f"[DELIVERY] {payload['metric_name']} "
-            f"| HTTP {response.status_code}"
-        )
+        rows = conn.execute("""
+            SELECT *
+            FROM collectors
+            WHERE tenant_id = ?
+        """, (tenant_id,)).fetchall()
 
-        if response.status_code in (200, 201):
+        results = []
 
-            try:
-                result = response.json()
-            except ValueError:
-                result = response.text[:500]
+        for row in rows:
 
-            print("[BACKEND RESPONSE]", result)
+            collector = dict(row)
 
-            return True, None
+            last_heartbeat = collector["last_heartbeat"]
 
-        if response.status_code == 409:
+            online = False
 
-            print("[DUPLICATE] Payload already exists.")
+            if last_heartbeat:
+                try:
+                    heartbeat_time = datetime.fromisoformat(
+                        last_heartbeat
+                    )
 
-            return True, None
+                    online = (
+                        now - heartbeat_time
+                    ).total_seconds() <= offline_threshold_seconds
 
-        error = (
-            f"HTTP {response.status_code}: "
-            f"{response.text[:500]}"
-        )
+                except ValueError:
+                    online = False
 
-        print("[DELIVERY ERROR]", error)
+            collector["status"] = (
+                "Online" if online else "Offline"
+            )
 
-        return False, error
+            results.append(collector)
 
-    except requests.RequestException as error:
-
-        print("[NETWORK ERROR]", error)
-
-        return False, str(error)
-
-
-# ============================================================
-# BUFFER DELIVERY
-# ============================================================
-
-def flush_buffer():
-
-    pending = get_pending_events()
-
-    if not pending:
-        return
-
-    print(
-        f"\n[BUFFER] Attempting to deliver "
-        f"{len(pending)} queued events..."
+    online_count = sum(
+        1 for item in results
+        if item["status"] == "Online"
     )
 
-    for payload_id, payload_json, attempts in pending:
+    return {
+        "tenant_id": tenant_id,
+        "total_collectors": len(results),
+        "online_collectors": online_count,
+        "offline_collectors": len(results) - online_count,
+        "offline_threshold_seconds": offline_threshold_seconds,
+        "collectors": results
+    }
 
-        try:
 
-            payload = json.loads(payload_json)
+# ============================================================
+# INCIDENT CORRELATION
+# ============================================================
 
-        except json.JSONDecodeError as error:
+def create_or_update_incident(event):
 
-            update_failed_event(
-                payload_id,
-                attempts + 1,
-                error
+    now = current_time()
+
+    window_start = (
+        datetime.now(timezone.utc) - timedelta(minutes=5)
+    ).isoformat()
+
+    with get_db() as conn:
+
+        existing = conn.execute("""
+            SELECT *
+            FROM incidents
+            WHERE tenant_id = ?
+            AND metric_name = ?
+            AND source_id = ?
+            AND status IN ('Open', 'Acknowledged', 'Investigating')
+            AND created_at >= ?
+            ORDER BY created_at DESC
+            LIMIT 1
+        """, (
+            event.tenant_id,
+            event.metric_name,
+            event.source_id,
+            window_start
+        )).fetchone()
+
+        if existing:
+
+            conn.execute("""
+                UPDATE incidents
+                SET occurrence_count = occurrence_count + 1,
+                    severity = CASE
+                        WHEN severity = 'critical'
+                        OR ? = 'critical'
+                        THEN 'critical'
+                        ELSE 'warning'
+                    END,
+                    updated_at = ?
+                WHERE incident_id = ?
+            """, (
+                event.severity,
+                now,
+                existing["incident_id"]
+            ))
+
+            conn.commit()
+
+            return {
+                "incident_id": existing["incident_id"],
+                "action": "correlated"
+            }
+
+        incident_id = str(uuid.uuid4())
+
+        conn.execute("""
+            INSERT INTO incidents (
+                incident_id,
+                tenant_id,
+                title,
+                description,
+                severity,
+                status,
+                metric_name,
+                source_id,
+                occurrence_count,
+                created_at,
+                updated_at
             )
+            VALUES (?, ?, ?, ?, ?, 'Open', ?, ?, 1, ?, ?)
+        """, (
+            incident_id,
+            event.tenant_id,
+            f"{event.severity.upper()}: {event.metric_name}",
+            event.alert_context or "Telemetry threshold exceeded",
+            event.severity,
+            event.metric_name,
+            event.source_id,
+            now,
+            now
+        ))
 
-            print(
-                f"[BUFFER ERROR] Invalid payload {payload_id}"
-            )
+        conn.commit()
 
-            continue
+    return {
+        "incident_id": incident_id,
+        "action": "created"
+    }
 
-        success, error = send_event(payload)
 
-        if success:
+# ============================================================
+# INCIDENT RETRIEVAL
+# ============================================================
 
-            remove_event(payload_id)
+@app.get("/api/v1/incidents")
+def get_incidents(
+    tenant_id: str,
+    status: Optional[str] = None
+):
 
-            print(
-                f"[DELIVERED] {payload_id}"
-            )
+    with get_db() as conn:
+
+        if status:
+
+            rows = conn.execute("""
+                SELECT *
+                FROM incidents
+                WHERE tenant_id = ?
+                AND status = ?
+                ORDER BY created_at DESC
+            """, (tenant_id, status)).fetchall()
 
         else:
 
-            update_failed_event(
-                payload_id,
-                attempts + 1,
-                error
+            rows = conn.execute("""
+                SELECT *
+                FROM incidents
+                WHERE tenant_id = ?
+                ORDER BY created_at DESC
+            """, (tenant_id,)).fetchall()
+
+    return {
+        "tenant_id": tenant_id,
+        "total_incidents": len(rows),
+        "incidents": [dict(row) for row in rows]
+    }
+
+
+# ============================================================
+# INCIDENT STATUS UPDATE
+# ============================================================
+
+@app.patch("/api/v1/incidents/{incident_id}/status")
+def update_incident_status(
+    incident_id: str,
+    update: IncidentStatusUpdate,
+    tenant_id: str
+):
+
+    with get_db() as conn:
+
+        incident = conn.execute("""
+            SELECT *
+            FROM incidents
+            WHERE incident_id = ?
+            AND tenant_id = ?
+        """, (incident_id, tenant_id)).fetchone()
+
+        if not incident:
+            raise HTTPException(
+                status_code=404,
+                detail="Incident not found"
             )
 
-            print(
-                f"[BUFFERED] {payload_id} "
-                f"| Attempts: {attempts + 1}"
+        previous_status = incident["status"]
+
+        conn.execute("""
+            UPDATE incidents
+            SET status = ?,
+                updated_at = ?
+            WHERE incident_id = ?
+            AND tenant_id = ?
+        """, (
+            update.status,
+            current_time(),
+            incident_id,
+            tenant_id
+        ))
+
+        conn.commit()
+
+    return {
+        "message": "Incident status updated successfully",
+        "incident_id": incident_id,
+        "previous_status": previous_status,
+        "current_status": update.status
+    }
+
+
+# ============================================================
+# REMEDIATION APPROVAL
+# ============================================================
+
+@app.post("/api/v1/remediation/approve")
+def approve_remediation(request: RemediationApproval):
+
+    audit_id = str(uuid.uuid4())
+
+    with get_db() as conn:
+
+        incident = conn.execute("""
+            SELECT incident_id
+            FROM incidents
+            WHERE incident_id = ?
+            AND tenant_id = ?
+        """, (
+            request.incident_id,
+            request.tenant_id
+        )).fetchone()
+
+        if not incident:
+            raise HTTPException(
+                status_code=404,
+                detail="Incident not found"
             )
 
-    print(
-        f"[BUFFER] Remaining events: {get_buffer_count()}"
+        conn.execute("""
+            INSERT INTO remediation_audit (
+                audit_id,
+                tenant_id,
+                incident_id,
+                action,
+                approved_by,
+                status,
+                details,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            audit_id,
+            request.tenant_id,
+            request.incident_id,
+            request.action,
+            request.approved_by,
+            "Approved",
+            "Approval recorded. No automatic system action executed.",
+            current_time()
+        ))
+
+        conn.commit()
+
+    return {
+        "message": "Remediation approval recorded successfully",
+        "audit_id": audit_id,
+        "incident_id": request.incident_id,
+        "status": "Approved"
+    }
+
+
+@app.get("/api/v1/remediation/audit")
+def get_remediation_audit(tenant_id: str):
+
+    with get_db() as conn:
+
+        rows = conn.execute("""
+            SELECT *
+            FROM remediation_audit
+            WHERE tenant_id = ?
+            ORDER BY created_at DESC
+        """, (tenant_id,)).fetchall()
+
+    return {
+        "tenant_id": tenant_id,
+        "total_records": len(rows),
+        "audit_records": [dict(row) for row in rows]
+    }
+
+
+# ============================================================
+# MACHINE LEARNING - MODEL UTILITIES
+# ============================================================
+
+def get_model_path(tenant_id, metric_name):
+
+    safe_tenant = "".join(
+        c for c in tenant_id if c.isalnum() or c in "-_"
     )
 
+    safe_metric = "".join(
+        c for c in metric_name if c.isalnum() or c in "-_"
+    )
+
+    return MODEL_DIR / f"{safe_tenant}_{safe_metric}.joblib"
+
+
+def get_training_records(tenant_id, limit):
+
+    with get_db() as conn:
+
+        rows = conn.execute("""
+            SELECT metric_name, metric_value, timestamp
+            FROM telemetry
+            WHERE tenant_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+        """, (
+            tenant_id,
+            limit
+        )).fetchall()
+
+    grouped = {}
+
+    for row in rows:
+
+        metric = row["metric_name"]
+
+        grouped.setdefault(metric, []).append({
+            "metric_value": float(row["metric_value"]),
+            "timestamp": row["timestamp"]
+        })
+
+    return grouped
+
+
+def load_model(tenant_id, metric_name):
+
+    model_path = get_model_path(
+        tenant_id,
+        metric_name
+    )
+
+    if not model_path.exists():
+        return None
+
+    try:
+        return joblib.load(model_path)
+
+    except Exception:
+        return None
+
 
 # ============================================================
-# MAIN LOOP
+# ML MODEL TRAINING
 # ============================================================
 
-def main():
+@app.post("/api/v1/aiops/ml/train")
+def train_ml_models(
+    tenant_id: str,
+    limit: int = Query(default=5000, ge=1, le=100000)
+):
 
-    print("=" * 60)
-    print("CICADA 2026 - SMART OBSERVABILITY COLLECTOR")
-    print("=" * 60)
+    grouped_records = get_training_records(
+        tenant_id,
+        limit
+    )
 
-    print("Tenant:", TENANT_ID)
-    print("Collector:", COLLECTOR_ID)
-    print("Source:", SOURCE_ID)
-    print("Region:", REGION)
-    print("Backend:", BACKEND_URL)
-
-    initialize_buffer()
-
-    # Initialize CPU measurement.
-    psutil.cpu_percent(interval=None)
-
-    if not check_backend():
-
-        print(
-            "[WARNING] Backend is currently unreachable. "
-            "Telemetry will be buffered."
+    if not grouped_records:
+        raise HTTPException(
+            status_code=404,
+            detail="No telemetry records found for this tenant."
         )
 
-    else:
+    training_results = []
 
-        register_collector()
+    for metric_name, records in grouped_records.items():
 
-        send_heartbeat()
+        values = np.array([
+            record["metric_value"]
+            for record in records
+        ]).reshape(-1, 1)
 
-    last_heartbeat = time.time()
+        if len(values) < MINIMUM_TRAINING_SAMPLES:
 
-    print("\n[COLLECTOR] Starting collection...\n")
+            training_results.append({
+                "metric_name": metric_name,
+                "status": "Insufficient data",
+                "samples": len(values),
+                "minimum_required": MINIMUM_TRAINING_SAMPLES
+            })
 
-    while True:
+            continue
 
-        try:
+        model = IsolationForest(
+            n_estimators=100,
+            contamination=DEFAULT_CONTAMINATION,
+            random_state=42
+        )
 
-            # 1. Collect metrics.
-            events = collect_system_metrics()
+        model.fit(values)
 
-            # 2. Persist every event before attempting delivery.
-            for event in events:
+        model_path = get_model_path(
+            tenant_id,
+            metric_name
+        )
 
-                enqueue_event(event)
+        joblib.dump(model, model_path)
 
-                print(
-                    f"[COLLECTED] {event['metric_name']}: "
-                    f"{event['metric_value']} "
-                    f"{event['metric_unit']} "
-                    f"| Health: {event['health_state']}"
-                )
+        training_results.append({
+            "metric_name": metric_name,
+            "status": "Trained",
+            "samples": len(values),
+            "algorithm": "Isolation Forest",
+            "model_file": model_path.name
+        })
 
-            print(
-                f"[BUFFER] Total queued: {get_buffer_count()}"
-            )
+    trained_count = sum(
+        1 for item in training_results
+        if item["status"] == "Trained"
+    )
 
-            # 3. Deliver queued telemetry.
-            flush_buffer()
+    return {
+        "message": "ML training process completed",
+        "tenant_id": tenant_id,
+        "total_metrics": len(grouped_records),
+        "trained_models": trained_count,
+        "results": training_results
+    }
 
-            # 4. Send periodic heartbeat.
-            if (
-                time.time() - last_heartbeat
-                >= HEARTBEAT_INTERVAL
-            ):
 
-                send_heartbeat()
+# ============================================================
+# ML MODEL STATUS
+# ============================================================
 
-                last_heartbeat = time.time()
+@app.get("/api/v1/aiops/ml/status")
+def ml_model_status(tenant_id: str):
 
-            print(
-                f"\n[WAITING] Next collection in "
-                f"{COLLECTION_INTERVAL} seconds...\n"
-            )
+    grouped_records = get_training_records(
+        tenant_id,
+        100000
+    )
 
-            time.sleep(COLLECTION_INTERVAL)
+    results = []
 
-        except KeyboardInterrupt:
+    for metric_name, records in grouped_records.items():
 
-            print("\n[COLLECTOR] Stopped.")
+        model_path = get_model_path(
+            tenant_id,
+            metric_name
+        )
 
-            print(
-                "[BUFFER] Preserved queued events:",
-                get_buffer_count()
-            )
+        results.append({
+            "metric_name": metric_name,
+            "samples_available": len(records),
+            "model_trained": model_path.exists(),
+            "minimum_required": MINIMUM_TRAINING_SAMPLES
+        })
 
-            break
+    return {
+        "tenant_id": tenant_id,
+        "algorithm": "Isolation Forest",
+        "total_metrics": len(results),
+        "trained_models": sum(
+            1 for item in results
+            if item["model_trained"]
+        ),
+        "models": results
+    }
 
-        except Exception as error:
 
-            print(
-                f"[COLLECTOR ERROR] "
-                f"{type(error).__name__}: {error}"
-            )
+# ============================================================
+# ML ANOMALY PREDICTION
+# ============================================================
 
-            time.sleep(5)
+@app.get("/api/v1/aiops/ml/predict")
+def predict_anomaly(
+    tenant_id: str,
+    metric_name: str,
+    metric_value: float
+):
 
-    session.close()
+    model = load_model(
+        tenant_id,
+        metric_name
+    )
 
+    if model is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Trained model not found. Train the model first."
+        )
+
+    prediction = int(
+        model.predict([[metric_value]])[0]
+    )
+
+    anomaly_score = float(
+        model.decision_function([[metric_value]])[0]
+    )
+
+    is_anomaly = prediction == -1
+
+    return {
+        "tenant_id": tenant_id,
+        "metric_name": metric_name,
+        "metric_value": metric_value,
+        "prediction": (
+            "Anomaly" if is_anomaly else "Normal"
+        ),
+        "is_anomaly": is_anomaly,
+        "anomaly_score": round(anomaly_score, 6),
+        "algorithm": "Isolation Forest"
+    }
+
+
+# ============================================================
+# ML ANALYSIS OF LATEST TELEMETRY
+# ============================================================
+
+@app.get("/api/v1/aiops/analyze")
+def analyze_telemetry(tenant_id: str):
+
+    with get_db() as conn:
+
+        rows = conn.execute("""
+            SELECT *
+            FROM telemetry
+            WHERE tenant_id = ?
+            ORDER BY id DESC
+            LIMIT 100
+        """, (tenant_id,)).fetchall()
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail="No telemetry available for analysis."
+        )
+
+    results = []
+
+    for row in rows:
+
+        metric_name = row["metric_name"]
+        metric_value = float(row["metric_value"])
+
+        model = load_model(
+            tenant_id,
+            metric_name
+        )
+
+        if model is None:
+
+            results.append({
+                "payload_id": row["payload_id"],
+                "metric_name": metric_name,
+                "metric_value": metric_value,
+                "ml_status": "Model not trained"
+            })
+
+            continue
+
+        prediction = int(
+            model.predict([[metric_value]])[0]
+        )
+
+        score = float(
+            model.decision_function([[metric_value]])[0]
+        )
+
+        results.append({
+            "payload_id": row["payload_id"],
+            "metric_name": metric_name,
+            "metric_value": metric_value,
+            "prediction": (
+                "Anomaly" if prediction == -1 else "Normal"
+            ),
+            "is_anomaly": prediction == -1,
+            "anomaly_score": round(score, 6)
+        })
+
+    anomaly_count = sum(
+        1 for item in results
+        if item.get("is_anomaly") is True
+    )
+
+    return {
+        "tenant_id": tenant_id,
+        "total_analyzed": len(results),
+        "anomalies_detected": anomaly_count,
+        "normal_records": len(results) - anomaly_count,
+        "results": results
+    }
+
+
+# ============================================================
+# RUN APPLICATION
+# ============================================================
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+
+    uvicorn.run(
+        "backend:app",
+        host="127.0.0.1",
+        port=8000,
+        reload=True
+    )
